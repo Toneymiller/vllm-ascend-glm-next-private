@@ -6,6 +6,7 @@ import torch
 import torch_npu
 
 
+
 def _fa3_available() -> bool:
     try:
         if util.find_spec("flash_attn_npu_v3") is None:

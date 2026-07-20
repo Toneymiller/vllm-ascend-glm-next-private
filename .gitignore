@@ -229,3 +229,4 @@ csrc/third_party/
 .codegraph/
 
 .vllm_ascend/
+.codemate
