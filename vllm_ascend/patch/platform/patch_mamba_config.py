@@ -131,10 +131,11 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # compute new attention page size
     attn_page_size = cache_config.block_size * attn_token_page_size
 
-    # GLM5-Next separately allocates Mamba/KDA and Indexer/MLA cache groups,
-    # so their physical page sizes need not be identical. The KDA page must
-    # still hold both SSM and conv states. Other hybrid models retain the
-    # established extra conv padding behavior.
+    # GLM5-Next shares each large physical tensor slot between one MLA layer
+    # and up to one KDA layer from each KDA group. Their page strides must
+    # therefore match, while the smaller indexer/state tensors use a separate
+    # page-size class. Other hybrid models retain the established extra conv
+    # padding behavior.
     mamba_raw_size = sum(mamba_sizes)
     is_glm5_next = model_config.hf_config.model_type == "glm5_next"
     target_page_size = _get_mamba_target_page_size(

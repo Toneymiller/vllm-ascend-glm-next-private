@@ -306,12 +306,9 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec) -> AttentionCGSupport:
-        if getattr(vllm_config, "speculative_config", None) is not None:
-            # Lightning Indexer's right-down causal mask does not model the
-            # compressed-pool boundary for multi-token speculative queries.
-            return AttentionCGSupport.NEVER
         # The graph path uses fixed-shape cache updates and is only valid for
-        # uniform decode batches. Prefill keeps the eager implementation.
+        # uniform decode batches. The GLM MTP proposer is forced to eager mode
+        # independently; its presence must not disable the target model graph.
         return AttentionCGSupport.UNIFORM_BATCH
 
     def _build(self, common_attn_metadata, draft_index: int | None = None):
@@ -421,11 +418,11 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             torch.zeros_like(values),
         ).sum(dim=0)
         expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
-        torch_npu.npu_scatter_nd_update_(
-            cache_rows,
-            safe_slots.view(-1, 1),
-            safe_values,
-        )
+        # Do not use npu_scatter_nd_update_ here: graph compilation resolves
+        # it to aclnnScatterNdUpdateV2, which is unavailable in older CANN
+        # libopapi builds. The fixed-shape indexed assignment is graphable and
+        # row zero is restored below after padded rows temporarily target it.
+        cache_rows[safe_slots] = safe_values
         cache_rows[0].copy_(expected_zero)
 
     def _get_indexer_slot_mapping(self, attn_metadata):

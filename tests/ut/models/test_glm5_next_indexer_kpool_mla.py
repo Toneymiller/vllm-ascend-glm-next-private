@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import vllm.v1.core.kv_cache_utils as upstream_kv_cache_utils
 from transformers import AutoConfig
 from vllm import ModelRegistry
 from vllm.config.compilation import CUDAGraphMode
@@ -56,8 +57,11 @@ from vllm_ascend.patch.platform.patch_glm5_next_config import (
     Glm5NextModelArchConfigConvertor,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _align_glm5_cache_specs,
     _create_uniform_mamba_groups,
+    _get_glm5_cache_layout,
     _get_kv_cache_config_deepseek_v4,
+    _max_memory_usage_bytes_from_groups,
 )
 from vllm_ascend.patch.platform.patch_mamba_config import (
     _get_mamba_target_page_size,
@@ -104,6 +108,23 @@ def test_indexer_kpool_mla_specs_allocate_one_physical_vector_per_role():
     assert state_spec.sliding_window == 4
 
 
+def test_glm5_allocator_patches_the_installed_upstream_entrypoint():
+    allocator_names = (
+        "_get_kv_cache_config_deepseek_v4",
+        "_get_kv_cache_config_packed",
+    )
+    installed_names = [
+        name for name in allocator_names if hasattr(upstream_kv_cache_utils, name)
+    ]
+
+    assert installed_names
+    for name in installed_names:
+        assert (
+            getattr(upstream_kv_cache_utils, name)
+            is _get_kv_cache_config_deepseek_v4
+        )
+
+
 def test_indexer_kpool_mla_cache_roles_expose_v023_prefill_backend_sentinel():
     """Only the executable MLA cache passes through MLACommonMetadataBuilder."""
     assert IndexerKPoolMLACacheLayer.cache_role == "kv"
@@ -112,13 +133,17 @@ def test_indexer_kpool_mla_cache_roles_expose_v023_prefill_backend_sentinel():
 
 
 def test_indexer_kpool_mla_supports_uniform_decode_aclgraph():
-    assert (
-        AscendIndexerKPoolMLAMetadataBuilder.get_cudagraph_support(
-            SimpleNamespace(),
-            SimpleNamespace(),
+    for speculative_config in (
+        None,
+        SimpleNamespace(num_speculative_tokens=5),
+    ):
+        assert (
+            AscendIndexerKPoolMLAMetadataBuilder.get_cudagraph_support(
+                SimpleNamespace(speculative_config=speculative_config),
+                SimpleNamespace(),
+            )
+            is AttentionCGSupport.UNIFORM_BATCH
         )
-        is AttentionCGSupport.UNIFORM_BATCH
-    )
 
 
 def test_indexer_kpool_cache_only_builders_do_not_disable_uniform_decode_aclgraph():
@@ -135,16 +160,6 @@ def test_indexer_kpool_cache_only_builders_do_not_disable_uniform_decode_aclgrap
         )
 
 
-def test_indexer_kpool_mla_disables_full_graph_for_speculative_decode():
-    assert (
-        AscendIndexerKPoolMLAMetadataBuilder.get_cudagraph_support(
-            SimpleNamespace(speculative_config=SimpleNamespace()),
-            SimpleNamespace(),
-        )
-        is AttentionCGSupport.NEVER
-    )
-
-
 def test_indexer_kpool_mla_participates_in_post_load_weight_processing():
     wrapper = object.__new__(AscendIndexerKPoolMLAAttention)
     assert _is_ascend_attention(wrapper)
@@ -157,10 +172,7 @@ def test_indexer_kpool_mla_collects_metadata_by_exact_cache_layer_name():
         SimpleNamespace(prefix=f"{prefix}.indexer.compressor.state_cache"),
         SimpleNamespace(prefix=f"{prefix}.indexer.k_cache"),
     )
-    expected = tuple(
-        SimpleNamespace(cache_role=role)
-        for role in ("kv", "indexer_state", "indexer")
-    )
+    expected = tuple(SimpleNamespace(cache_role=role) for role in ("kv", "indexer_state", "indexer"))
     metadata = {
         f"{prefix}.attn": expected[0],
         f"{prefix}.indexer.compressor.state_cache": expected[1],
@@ -224,9 +236,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     first_slot_mapping_ptr = metadata.slot_mapping.data_ptr()
     first_seq_lens_ptr = metadata.seq_lens.data_ptr()
     common_metadata.positions = torch.tensor([4, 5, 6, 7])
-    common_metadata.slot_mapping = torch.tensor(
-        [9 * 128 + offset for offset in range(4, 8)]
-    )
+    common_metadata.slot_mapping = torch.tensor([9 * 128 + offset for offset in range(4, 8)])
     common_metadata.seq_lens = torch.tensor([8], dtype=torch.int32)
     common_metadata._seq_lens_cpu = torch.tensor([8], dtype=torch.int32)
     common_metadata.block_table_tensor = torch.tensor([[9]], dtype=torch.int32)
@@ -510,7 +520,169 @@ def test_indexer_kpool_mla_state_block_table_maps_request_tail_pages():
     ]
 
 
-def test_indexer_kpool_mla_standalone_mtp_allocator_keeps_every_cache_role():
+def _uniform_group(specs, *names):
+    group_specs = {name: specs[name] for name in names}
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(group_specs)
+    assert uniform_spec is not None
+    return KVCacheGroupSpec(list(names), uniform_spec)
+
+
+def _make_glm5_cache_groups(
+    *,
+    include_mtp: bool,
+    num_speculative_tokens: int = 0,
+):
+    mla_layer_indices = list(range(3, 44, 4))
+    if include_mtp:
+        mla_layer_indices.append(45)
+    mamba_layer_indices = [idx for idx in range(45) if idx % 4 != 3]
+    specs = {}
+    for layer_idx in mla_layer_indices:
+        prefix = f"model.layers.{layer_idx}.self_attn"
+        specs[f"{prefix}.attn"] = MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            model_version="glm5_next",
+        )
+        specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            compress_ratio=16,
+            model_version="glm5_next",
+        )
+        specs[f"{prefix}.indexer.compressor.state_cache"] = AscendIndexerKPoolStateSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=16,
+            cache_role="indexer_state",
+            model_version="glm5_next",
+        )
+    for layer_idx in mamba_layer_indices:
+        specs[f"model.layers.{layer_idx}.mamba"] = MambaSpec(
+            block_size=128,
+            shapes=(
+                (3 + num_speculative_tokens, 1536),
+                (4, 128, 128),
+            ),
+            dtypes=(torch.bfloat16, torch.float32),
+            num_speculative_blocks=num_speculative_tokens,
+        )
+
+    _align_glm5_cache_specs(specs)
+    mla_names = [name for name in specs if name.endswith(".attn")]
+    indexer_names = [name for name in specs if name.endswith(".indexer.k_cache")]
+    state_names = [name for name in specs if name.endswith(".state_cache")]
+    groups = [
+        _uniform_group(specs, *mla_names),
+        _uniform_group(specs, *indexer_names),
+        _uniform_group(specs, *state_names),
+    ]
+    if mamba_layer_indices:
+        mamba_specs = {name: spec for name, spec in specs.items() if isinstance(spec, MambaSpec)}
+        mamba_names = [
+            [f"model.layers.{layer_idx}.mamba" for layer_idx in mamba_layer_indices if layer_idx % 4 == group_idx]
+            for group_idx in range(3)
+        ]
+        groups.extend(_create_uniform_mamba_groups(mamba_specs, mamba_names))
+    return specs, groups
+
+
+def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
+    specs, groups = _make_glm5_cache_groups(include_mtp=False)
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+    assert [len(group.layer_names) for group in layout.mamba_groups] == [12, 11, 11]
+    assert layout.main_slot_count == 12
+    assert layout.small_slot_count == 11
+    assert layout.main_page_size == max(
+        spec.real_page_size_bytes
+        for spec in specs.values()
+        if isinstance(spec, (MLAAttentionSpec, MambaSpec)) and getattr(spec, "compress_ratio", 1) == 1
+    )
+    assert layout.main_page_size == 271360
+    assert layout.small_page_size == 16 * 256 * 2
+
+    bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+    num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+        vllm_config,
+        groups,
+        available_memory=bytes_per_block * 3,
+    )
+
+    assert num_blocks == 3
+    assert len(tensors) == 23
+    assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
+    assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
+    assert tensors[0].shared_by == [
+        "model.layers.3.self_attn.attn",
+        "model.layers.0.mamba",
+        "model.layers.1.mamba",
+        "model.layers.2.mamba",
+    ]
+    assert tensors[11].shared_by == ["model.layers.44.mamba"]
+    assert tensors[12].shared_by == [
+        "model.layers.3.self_attn.indexer.k_cache",
+        "model.layers.3.self_attn.indexer.compressor.state_cache",
+    ]
+
+
+def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
+    _, groups = _make_glm5_cache_groups(
+        include_mtp=True,
+        num_speculative_tokens=5,
+    )
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+    assert layout.main_slot_count == 12
+    assert layout.small_slot_count == 12
+
+    bytes_per_block = 12 * layout.main_page_size + 12 * layout.small_page_size
+    num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+        SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=None)),
+        groups,
+        available_memory=bytes_per_block * 2,
+    )
+
+    assert num_blocks == 2
+    assert len(tensors) == 24
+    assert tensors[11].shared_by == [
+        "model.layers.45.self_attn.attn",
+        "model.layers.44.mamba",
+    ]
+    assert tensors[-1].shared_by == [
+        "model.layers.45.self_attn.indexer.k_cache",
+        "model.layers.45.self_attn.indexer.compressor.state_cache",
+    ]
+
+
+def test_glm5_target_mtp5_keeps_slot_counts_and_expands_kda_page():
+    specs, groups = _make_glm5_cache_groups(
+        include_mtp=False,
+        num_speculative_tokens=5,
+    )
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+
+    assert layout.main_slot_count == 12
+    assert layout.small_slot_count == 11
+    assert layout.main_page_size == 286720
+    assert {
+        spec.num_speculative_blocks
+        for spec in specs.values()
+        if isinstance(spec, MambaSpec)
+    } == {5}
+
+
+def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     specs = {
         "layer.attn": MLAAttentionSpec(
             block_size=128,
@@ -537,6 +709,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_keeps_every_cache_role():
             model_version="glm5_next",
         ),
     }
+    _align_glm5_cache_specs(specs)
     groups = [
         KVCacheGroupSpec(
             list(group_specs),
@@ -551,7 +724,10 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_keeps_every_cache_role():
             {"layer.indexer.compressor.state_cache": specs["layer.indexer.compressor.state_cache"]},
         )
     ]
-    bytes_per_block = sum(spec.page_size_bytes for spec in specs.values())
+    main_page_size = specs["layer.attn"].page_size_bytes
+    small_page_size = specs["layer.indexer.k_cache"].page_size_bytes
+    assert small_page_size == specs["layer.indexer.compressor.state_cache"].page_size_bytes
+    bytes_per_block = main_page_size + small_page_size
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )
@@ -563,10 +739,32 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_keeps_every_cache_role():
     )
 
     assert num_blocks == 3
-    assert {tensor.shared_by[0] for tensor in tensors} == set(specs)
-    assert {tensor.shared_by[0]: tensor.size for tensor in tensors} == {
-        name: spec.page_size_bytes * num_blocks for name, spec in specs.items()
-    }
+    assert len(tensors) == 2
+    assert tensors[0].shared_by == ["layer.attn"]
+    assert tensors[0].size == main_page_size * num_blocks
+    assert tensors[1].shared_by == [
+        "layer.indexer.k_cache",
+        "layer.indexer.compressor.state_cache",
+    ]
+    assert tensors[1].size == small_page_size * num_blocks
+
+
+def test_glm5_memory_accounting_charges_shared_pool_for_every_group():
+    _, groups = _make_glm5_cache_groups(include_mtp=False)
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1024),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+    )
+    blocks_needed = sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in groups)
+    bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
+
+    assert _max_memory_usage_bytes_from_groups(vllm_config, groups) == (blocks_needed * bytes_per_block)
 
 
 def test_indexer_kpool_mla_compressed_slot_mapping_only_writes_completed_pools():
@@ -711,9 +909,7 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
     mock_scatter,
     mock_get_forward_context,
 ):
-    mock_get_forward_context.return_value = SimpleNamespace(
-        cudagraph_runtime_mode=CUDAGraphMode.FULL
-    )
+    mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
     cache = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
     slots = torch.tensor([2, -1], dtype=torch.int64)
     values = torch.ones((2, 1, 8), dtype=torch.bfloat16)
@@ -725,11 +921,9 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
         values,
     )
 
-    scatter_cache, scatter_slots, scatter_values = mock_scatter.call_args.args
-    assert scatter_cache.shape == (4, 8)
-    assert scatter_slots.tolist() == [[2], [0]]
-    assert scatter_values.shape == (2, 8)
-    assert scatter_values[1].tolist() == [0.0] * 8
+    mock_scatter.assert_not_called()
+    assert cache.view(-1, 8)[2].tolist() == [1.0] * 8
+    assert cache.view(-1, 8)[0].tolist() == [0.0] * 8
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
@@ -740,12 +934,6 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_lightning_indexer,
     mock_get_forward_context,
 ):
-    def scatter_rows(cache, indices, updates):
-        for row, index in enumerate(indices.tolist()):
-            index = tuple(index)
-            cache[index] = updates[row]
-
-    mock_scatter.side_effect = scatter_rows
     mock_lightning_indexer.return_value = (
         torch.tensor([[[0]], [[-1]]], dtype=torch.int32),
         torch.empty(0),
@@ -819,6 +1007,7 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     assert result[1, 0].tolist() == [-1, -1, -1, -1, 0, -1, -1]
     assert indexer_cache[0, 0, 0, 0] > 0
     assert mock_lightning_indexer.call_count == 1
+    mock_scatter.assert_not_called()
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():

@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import (
     _approximate_gcd,
@@ -21,10 +23,182 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.utils import vllm_version_is
-
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_max_memory_usage_bytes_from_groups = getattr(
+    vllm.v1.core.kv_cache_utils,
+    "_max_memory_usage_bytes_from_groups",
+    None,
+)
+
+
+@dataclass(frozen=True)
+class _Glm5CacheLayout:
+    main_group: KVCacheGroupSpec
+    indexer_group: KVCacheGroupSpec
+    state_group: KVCacheGroupSpec
+    mamba_groups: tuple[KVCacheGroupSpec, ...]
+    mla_names: tuple[str, ...]
+    indexer_names: tuple[str, ...]
+    state_names: tuple[str, ...]
+    main_page_size: int
+    small_page_size: int
+    main_slot_count: int
+    small_slot_count: int
+
+
+def _is_glm5_spec(spec: KVCacheSpec) -> bool:
+    return getattr(spec, "model_version", None) == "glm5_next"
+
+
+def _unpadded_page_size(spec: KVCacheSpec) -> int:
+    if hasattr(spec, "unpadded_page_size_bytes"):
+        return spec.unpadded_page_size_bytes
+    if hasattr(spec, "real_page_size_bytes"):
+        return spec.real_page_size_bytes
+    return spec.page_size_bytes
+
+
+def _sorted_layer_names(layer_names: list[str]) -> tuple[str, ...]:
+    try:
+        return tuple(sorted(layer_names, key=extract_layer_index))
+    except ValueError:
+        # Synthetic/unit-test names need not contain a numeric layer index.
+        return tuple(layer_names)
+
+
+def _layer_indices(layer_names: tuple[str, ...]) -> tuple[int, ...] | None:
+    try:
+        return tuple(extract_layer_index(name) for name in layer_names)
+    except ValueError:
+        return None
+
+
+def _align_glm5_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
+    """Align GLM-5 specs into two physical page-size classes in-place."""
+
+    main_specs = [
+        spec
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio == 1
+    ]
+    indexer_specs = [
+        spec
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio > 1
+    ]
+    state_specs = [
+        spec
+        for spec in kv_cache_spec.values()
+        if getattr(spec, "cache_role", None) == "indexer_state" and _is_glm5_spec(spec)
+    ]
+    mamba_specs = [spec for spec in kv_cache_spec.values() if isinstance(spec, MambaSpec)]
+
+    if not main_specs and not indexer_specs and not state_specs:
+        return
+    if not main_specs or not indexer_specs or not state_specs:
+        raise ValueError("GLM-5 cache layout requires main MLA, compressed indexer, and compressor-state specs.")
+
+    main_page_size = max(spec.page_size_bytes for spec in (*main_specs, *mamba_specs))
+    main_page_size = max(
+        main_page_size,
+        *(_unpadded_page_size(spec) for spec in (*main_specs, *mamba_specs)),
+    )
+    small_page_size = max(spec.page_size_bytes for spec in (*indexer_specs, *state_specs))
+    small_page_size = max(
+        small_page_size,
+        *(_unpadded_page_size(spec) for spec in (*indexer_specs, *state_specs)),
+    )
+
+    for spec in (*main_specs, *mamba_specs):
+        object.__setattr__(spec, "page_size_padded", main_page_size)
+    for spec in (*indexer_specs, *state_specs):
+        object.__setattr__(spec, "page_size_padded", small_page_size)
+
+
+def _get_glm5_cache_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> _Glm5CacheLayout | None:
+    if not kv_cache_groups or not all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups
+    ):
+        return None
+
+    main_groups: list[KVCacheGroupSpec] = []
+    indexer_groups: list[KVCacheGroupSpec] = []
+    state_groups: list[KVCacheGroupSpec] = []
+    mamba_groups: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        specs = group.kv_cache_spec.kv_cache_specs
+        values = list(specs.values())
+        if all(isinstance(spec, MambaSpec) for spec in values):
+            mamba_groups.append(group)
+        elif all(
+            isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio == 1 for spec in values
+        ):
+            main_groups.append(group)
+        elif all(
+            isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio > 1 for spec in values
+        ):
+            indexer_groups.append(group)
+        elif all(getattr(spec, "cache_role", None) == "indexer_state" and _is_glm5_spec(spec) for spec in values):
+            state_groups.append(group)
+
+    has_glm5_group = bool(main_groups or indexer_groups or state_groups)
+    if not has_glm5_group:
+        return None
+    if len(main_groups) != 1 or len(indexer_groups) != 1 or len(state_groups) != 1:
+        raise ValueError(
+            "GLM-5 requires exactly one main MLA, one compressed indexer, and one compressor-state KV cache group."
+        )
+    classified = len(main_groups) + len(indexer_groups) + len(state_groups) + len(mamba_groups)
+    if classified != len(kv_cache_groups):
+        raise ValueError("GLM-5 KV cache groups contain an unsupported cache spec.")
+
+    main_group = main_groups[0]
+    indexer_group = indexer_groups[0]
+    state_group = state_groups[0]
+    mla_names = _sorted_layer_names(main_group.layer_names)
+    indexer_names = _sorted_layer_names(indexer_group.layer_names)
+    state_names = _sorted_layer_names(state_group.layer_names)
+    if not (len(mla_names) == len(indexer_names) == len(state_names)):
+        raise ValueError("Every GLM-5 MLA layer must own one compressed indexer and one compressor-state cache.")
+    mla_indices = _layer_indices(mla_names)
+    if mla_indices is not None and (
+        mla_indices != _layer_indices(indexer_names) or mla_indices != _layer_indices(state_names)
+    ):
+        raise ValueError("GLM-5 MLA, indexer, and state cache layer indices do not match.")
+
+    main_specs = main_group.kv_cache_spec.kv_cache_specs
+    indexer_specs = indexer_group.kv_cache_spec.kv_cache_specs
+    state_specs = state_group.kv_cache_spec.kv_cache_specs
+    main_page_sizes = {spec.page_size_bytes for spec in main_specs.values()} | {
+        spec.page_size_bytes for group in mamba_groups for spec in group.kv_cache_spec.kv_cache_specs.values()
+    }
+    small_page_sizes = {spec.page_size_bytes for spec in (*indexer_specs.values(), *state_specs.values())}
+    if len(main_page_sizes) != 1 or len(small_page_sizes) != 1:
+        raise ValueError("GLM-5 cache specs were not aligned to two physical page sizes.")
+
+    sorted_mamba_groups = tuple(mamba_groups)
+    main_slot_count = max(
+        [
+            len(mla_names),
+            *(len(group.layer_names) for group in sorted_mamba_groups),
+        ]
+    )
+    return _Glm5CacheLayout(
+        main_group=main_group,
+        indexer_group=indexer_group,
+        state_group=state_group,
+        mamba_groups=sorted_mamba_groups,
+        mla_names=mla_names,
+        indexer_names=indexer_names,
+        state_names=state_names,
+        main_page_size=main_page_sizes.pop(),
+        small_page_size=small_page_sizes.pop(),
+        main_slot_count=main_slot_count,
+        small_slot_count=len(indexer_names),
+    )
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -84,7 +258,9 @@ def group_and_unify_kv_cache_specs(
             ratio_specs[spec.compress_ratio][name] = spec
 
     mla_uniform_specs = []
-    for ratio in sorted(ratio_specs, key=lambda r: (r != 4, r)):
+    is_glm5 = any(_is_glm5_spec(spec) for spec in kv_cache_spec.values())
+    ratio_sort_key = (lambda ratio: (ratio != 1, ratio)) if is_glm5 else (lambda ratio: (ratio != 4, ratio))
+    for ratio in sorted(ratio_specs, key=ratio_sort_key):
         spec_dict = ratio_specs[ratio]
         assert len(spec_dict) > 0
         mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(spec_dict))
@@ -105,13 +281,11 @@ def _create_uniform_mamba_groups(
 ) -> list[KVCacheGroupSpec]:
     groups = []
     for layer_names in grouped_layer_names:
+        layer_names = list(_sorted_layer_names(layer_names))
         layer_specs = {name: mamba_specs[name] for name in layer_names}
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(layer_specs)
         if uniform_spec is None:
-            raise ValueError(
-                "GLM-5 Mamba layers in one KV cache group must have "
-                "uniform block-table semantics."
-            )
+            raise ValueError("GLM-5 Mamba layers in one KV cache group must have uniform block-table semantics.")
         groups.append(KVCacheGroupSpec(layer_names, uniform_spec))
     return groups
 
@@ -123,8 +297,14 @@ def get_kv_cache_groups(
     """Keep GLM-5 Mamba states out of the MLA grouping fast path."""
 
     is_glm5 = any(getattr(spec, "model_version", None) == "glm5_next" for spec in kv_cache_spec.values())
+    if not is_glm5:
+        return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    _align_glm5_cache_specs(kv_cache_spec)
     mamba_specs = {name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)}
-    if not is_glm5 or not mamba_specs:
+    if not mamba_specs:
+        # MTP uses a standalone MLA runner. It still needs the same two-page
+        # layout, but has no KDA/Mamba groups to split out.
         return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
     attention_specs = {name: spec for name, spec in kv_cache_spec.items() if not isinstance(spec, MambaSpec)}
@@ -261,50 +441,40 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
-    glm5_specs = [
-        spec
-        for group in kv_cache_groups
-        for spec in (
-            group.kv_cache_spec.kv_cache_specs.values()
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            else (group.kv_cache_spec,)
-        )
-    ]
-    if any(getattr(spec, "model_version", None) == "glm5_next" for spec in glm5_specs):
-        # A standalone MTP runner has Indexer KPool MLA groups but no Mamba group, so vLLM
-        # selects the packed allocator. Keep every GLM-5 cache role in an
-        # independent tensor; otherwise the DeepSeek-specific bucket plan
-        # below omits the compressed indexer page because its size is not in
-        # the main KV/RoPE bucket set.
-        total_page_size = sum(
-            group.kv_cache_spec.page_size_bytes
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            else group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-            for group in kv_cache_groups
+    glm5_layout = _get_glm5_cache_layout(kv_cache_groups)
+    if glm5_layout is not None:
+        bytes_per_block = (
+            glm5_layout.main_slot_count * glm5_layout.main_page_size
+            + glm5_layout.small_slot_count * glm5_layout.small_page_size
         )
         num_blocks = may_override_num_blocks(
             vllm_config,
-            available_memory // total_page_size,
+            available_memory // bytes_per_block,
         )
-        kv_cache_tensors = []
-        for group in kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_specs = group.kv_cache_spec.kv_cache_specs
-                kv_cache_tensors.extend(
-                    KVCacheTensor(
-                        size=layer_specs[layer_name].page_size_bytes * num_blocks,
-                        shared_by=[layer_name],
-                    )
-                    for layer_name in group.layer_names
+        kv_cache_tensors: list[KVCacheTensor] = []
+        for slot_idx in range(glm5_layout.main_slot_count):
+            shared_by = []
+            if slot_idx < len(glm5_layout.mla_names):
+                shared_by.append(glm5_layout.mla_names[slot_idx])
+            for group in glm5_layout.mamba_groups:
+                if slot_idx < len(group.layer_names):
+                    shared_by.append(group.layer_names[slot_idx])
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=glm5_layout.main_page_size * num_blocks,
+                    shared_by=shared_by,
                 )
-            else:
-                kv_cache_tensors.extend(
-                    KVCacheTensor(
-                        size=group.kv_cache_spec.page_size_bytes * num_blocks,
-                        shared_by=[layer_name],
-                    )
-                    for layer_name in group.layer_names
+            )
+        for slot_idx in range(glm5_layout.small_slot_count):
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=glm5_layout.small_page_size * num_blocks,
+                    shared_by=[
+                        glm5_layout.indexer_names[slot_idx],
+                        glm5_layout.state_names[slot_idx],
+                    ],
                 )
+            )
         return num_blocks, kv_cache_tensors
 
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
@@ -353,17 +523,42 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Account for GLM-5's shared block-id pool and two page classes."""
+
+    glm5_layout = _get_glm5_cache_layout(kv_cache_groups)
+    if glm5_layout is None:
+        if _orig_max_memory_usage_bytes_from_groups is None:
+            raise RuntimeError("The installed vLLM does not expose group memory accounting.")
+        return _orig_max_memory_usage_bytes_from_groups(
+            vllm_config,
+            kv_cache_groups,
+        )
+
+    bytes_per_block = (
+        glm5_layout.main_slot_count * glm5_layout.main_page_size
+        + glm5_layout.small_slot_count * glm5_layout.small_page_size
+    )
+    blocks_needed = sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in kv_cache_groups)
+    return bytes_per_block * blocks_needed
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
-# vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
-# get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
-# the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.
-if vllm_version_is("0.23.0"):
+# Patch the allocator entry point that the installed upstream actually calls.
+# vLLM releases have used both names; the runtime is an unmodified upstream
+# package, so do not infer the symbol from local reference-tree changes.
+if hasattr(vllm.v1.core.kv_cache_utils, "_get_kv_cache_config_deepseek_v4"):
     vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
-else:
+if hasattr(vllm.v1.core.kv_cache_utils, "_get_kv_cache_config_packed"):
     vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed = _get_kv_cache_config_deepseek_v4
+if _orig_max_memory_usage_bytes_from_groups is not None:
+    vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _max_memory_usage_bytes_from_groups
 
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402
