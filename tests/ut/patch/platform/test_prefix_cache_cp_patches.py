@@ -7,6 +7,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashListWithBlockSize,
+    generate_scheduler_kv_cache_config,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
 )
@@ -21,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
@@ -197,6 +202,36 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
             16,
             id="full-attention-no-cp",
         ),
+        pytest.param(
+            lambda: MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                compress_ratio=16,
+                model_version="glm5_next",
+            ),
+            1,
+            1,
+            True,
+            128,
+            id="glm5-indexer-keeps-full-history-block-size",
+        ),
+        pytest.param(
+            lambda: AscendMLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                compress_ratio=4,
+                model_version="deepseek_v4",
+            ),
+            1,
+            1,
+            True,
+            512,
+            id="ascend-compressed-mla-scales-logical-block-size",
+        ),
     ],
 )
 def test_get_effective_block_size(
@@ -213,6 +248,90 @@ def test_get_effective_block_size(
     )
 
     assert coordinator._get_effective_block_size(spec_factory()) == expected
+
+
+def test_glm5_combined_full_group_uses_128_token_prefix_boundaries() -> None:
+    main_spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        model_version="glm5_next",
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=16,
+        model_version="glm5_next",
+    )
+    state_spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+        model_version="glm5_next",
+    )
+    full_group_spec = UniformTypeKVCacheSpecs.from_specs(
+        {"layer.attn": main_spec, "layer.indexer": indexer_spec}
+    )
+    state_group_spec = UniformTypeKVCacheSpecs.from_specs(
+        {"layer.state": state_spec}
+    )
+    assert full_group_spec is not None
+    assert state_group_spec is not None
+
+    worker_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["layer.attn", "layer.indexer"],
+                kv_cache_spec=full_group_spec,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["layer.state"],
+                kv_cache_spec=state_group_spec,
+            ),
+        ],
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+    scheduler_full_spec = scheduler_config.kv_cache_groups[0].kv_cache_spec
+
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=1,
+        pcp_world_size=1,
+        enable_caching=True,
+    )
+    assert isinstance(scheduler_full_spec, MLAAttentionSpec)
+    assert scheduler_full_spec.head_size == main_spec.head_size
+    assert scheduler_full_spec.compress_ratio == 1
+    assert coordinator._get_effective_block_size(scheduler_full_spec) == 128
+
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=1,
+        pcp=1,
+        block_size=128,
+    )
+    vllm_config.cache_config.hash_block_size = None
+    vllm_config.kv_transfer_config = None
+    scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
+        scheduler_config,
+        vllm_config,
+    )
+    assert (scheduler_block_size, hash_block_size) == (128, 16)
+
+    base_hashes = [bytes([i]) for i in range(16)]
+    full_group_hashes = BlockHashListWithBlockSize(
+        base_hashes,
+        hash_block_size,
+        scheduler_full_spec.block_size,
+    )
+    assert len(full_group_hashes) == 2
+    assert full_group_hashes[0] == b"".join(base_hashes[:8])
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

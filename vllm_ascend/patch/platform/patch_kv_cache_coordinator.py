@@ -159,12 +159,17 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self.use_eagle = use_eagle
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
         block_size = kv_cache_spec.block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
         if self.dcp_world_size * self.pcp_world_size > 1:
             block_size *= self.dcp_world_size * self.pcp_world_size
-        if hasattr(kv_cache_spec, "compress_ratio"):
+        # Only AscendMLAAttentionSpec is paired with CompressAttentionManager.
+        # Upstream MLAAttentionSpec may describe a physically compressed GLM-5
+        # indexer page while retaining full-attention scheduler semantics.
+        if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             compress_ratio = kv_cache_spec.compress_ratio or 1
             compress_ratio = compress_ratio if compress_ratio >= 1 else 1
             block_size *= compress_ratio

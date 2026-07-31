@@ -385,9 +385,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ) -> None:
         """Initialize metadata builders for every draft KV cache group.
 
-        vLLM v0.23.0 assumes all draft attention layers share one KV cache
-        group. GLM-next MTP has separate main MLA, compressed indexer, and
-        compressor-state caches, each with its own backend and cache spec.
+        GLM-next MTP has separate main MLA, compressed indexer, and
+        compressor-state cache layers with distinct backends/specs. Main MLA
+        and compressed indexer intentionally share one KV cache group ID.
         """
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,

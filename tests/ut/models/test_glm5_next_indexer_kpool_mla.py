@@ -18,7 +18,6 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import (
-    KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
@@ -58,11 +57,12 @@ from vllm_ascend.patch.platform.patch_glm5_next_config import (
     Glm5NextModelArchConfigConvertor,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
-    _align_glm5_cache_specs,
+    _create_glm5_attention_groups,
     _create_uniform_mamba_groups,
     _get_glm5_cache_layout,
     _get_kv_cache_config_deepseek_v4,
     _max_memory_usage_bytes_from_groups,
+    get_kv_cache_groups,
 )
 from vllm_ascend.patch.platform.patch_mamba_config import (
     GLM5_LOGICAL_BLOCK_SIZE,
@@ -604,13 +604,6 @@ def test_indexer_kpool_mla_state_block_table_maps_request_tail_pages():
     ]
 
 
-def _uniform_group(specs, *names):
-    group_specs = {name: specs[name] for name in names}
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(group_specs)
-    assert uniform_spec is not None
-    return KVCacheGroupSpec(list(names), uniform_spec)
-
-
 def _make_glm5_cache_groups(
     *,
     include_mtp: bool,
@@ -658,23 +651,132 @@ def _make_glm5_cache_groups(
             num_speculative_blocks=num_speculative_tokens,
         )
 
-    _align_glm5_cache_specs(specs)
-    mla_names = [name for name in specs if name.endswith(".attn")]
-    indexer_names = [name for name in specs if name.endswith(".indexer.k_cache")]
-    state_names = [name for name in specs if name.endswith(".state_cache")]
-    groups = [
-        _uniform_group(specs, *mla_names),
-        _uniform_group(specs, *indexer_names),
-        _uniform_group(specs, *state_names),
-    ]
-    if mamba_layer_indices:
-        mamba_specs = {name: spec for name, spec in specs.items() if isinstance(spec, MambaSpec)}
-        mamba_names = [
-            [f"model.layers.{layer_idx}.mamba" for layer_idx in mamba_layer_indices if layer_idx % 4 == group_idx]
-            for group_idx in range(3)
-        ]
-        groups.extend(_create_uniform_mamba_groups(mamba_specs, mamba_names))
+    ordered_names = []
+    for layer_idx in range(45):
+        if layer_idx in mla_layer_indices:
+            prefix = f"model.layers.{layer_idx}.self_attn"
+            ordered_names.extend(
+                [
+                    f"{prefix}.attn",
+                    f"{prefix}.indexer.compressor.state_cache",
+                    f"{prefix}.indexer.k_cache",
+                ]
+            )
+        else:
+            ordered_names.append(f"model.layers.{layer_idx}.mamba")
+    if include_mtp:
+        prefix = "model.layers.45.self_attn"
+        ordered_names.extend(
+            [
+                f"{prefix}.attn",
+                f"{prefix}.indexer.compressor.state_cache",
+                f"{prefix}.indexer.k_cache",
+            ]
+        )
+    specs = {name: specs[name] for name in ordered_names}
+    groups = get_kv_cache_groups(SimpleNamespace(), specs)
     return specs, groups
+
+
+def test_glm5_main_and_indexer_share_one_full_history_group():
+    _, groups = _make_glm5_cache_groups(include_mtp=False)
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+
+    assert len(groups) == 5
+    assert groups[0] is layout.full_group
+    assert groups[1] is layout.state_group
+    assert len(layout.full_group.layer_names) == 22
+    assert len(layout.state_group.layer_names) == 11
+    assert [len(group.layer_names) for group in layout.mamba_groups] == [12, 11, 11]
+
+    full_specs = layout.full_group.kv_cache_spec.kv_cache_specs
+    full_ratios = [full_specs[name].compress_ratio for name in layout.full_group.layer_names]
+    assert full_ratios == [ratio for _ in range(11) for ratio in (1, 16)]
+    assert layout.full_group.kv_cache_spec.block_size == 128
+    assert layout.state_group.kv_cache_spec.block_size == 16
+    assert {
+        full_specs[name].storage_block_size
+        for name in layout.indexer_names
+    } == {8}
+
+    layer_to_group_id = {
+        layer_name: group_id
+        for group_id, group in enumerate(groups)
+        for layer_name in group.layer_names
+    }
+    for layer_idx in range(3, 44, 4):
+        prefix = f"model.layers.{layer_idx}.self_attn"
+        assert layer_to_group_id[f"{prefix}.attn"] == 0
+        assert layer_to_group_id[f"{prefix}.indexer.k_cache"] == 0
+        assert layer_to_group_id[f"{prefix}.indexer.compressor.state_cache"] == 1
+    assert {
+        layer_to_group_id[name]
+        for name in layer_to_group_id
+        if name.endswith(".mamba")
+    } == {2, 3, 4}
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1024),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+    # One FullAttentionManager/block table reserves eight 128-token IDs for
+    # both physical caches instead of reserving eight IDs per cache role.
+    assert layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config) == 8
+    first_main, first_indexer = layout.full_group.layer_names[:2]
+    assert [
+        full_specs[name].max_memory_usage_bytes(vllm_config)
+        // full_specs[name].page_size_bytes
+        for name in (first_main, first_indexer)
+    ] == [8, 8]
+
+
+@pytest.mark.parametrize(
+    ("compress_ratio", "state_block_size", "state_window", "error"),
+    [
+        (10, 10, 10, "must be divisible"),
+        (4, 8, 8, "must equal the paired compression ratio"),
+        (4, 4, 8, "must equal the paired compression ratio"),
+    ],
+)
+def test_glm5_combined_group_validates_compression_geometry(
+    compress_ratio: int,
+    state_block_size: int,
+    state_window: int,
+    error: str,
+):
+    specs = {
+        "model.layers.0.self_attn.attn": MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            model_version="glm5_next",
+        ),
+        "model.layers.0.self_attn.indexer.k_cache": MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            compress_ratio=compress_ratio,
+            model_version="glm5_next",
+        ),
+        "model.layers.0.self_attn.indexer.compressor.state_cache": AscendIndexerKPoolStateSpec(
+            block_size=state_block_size,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=state_window,
+            cache_role="indexer_state",
+            model_version="glm5_next",
+        ),
+    }
+
+    with pytest.raises(ValueError, match=error):
+        _create_glm5_attention_groups(specs)
 
 
 def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
@@ -793,21 +895,10 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
             model_version="glm5_next",
         ),
     }
-    _align_glm5_cache_specs(specs)
-    groups = [
-        KVCacheGroupSpec(
-            list(group_specs),
-            UniformTypeKVCacheSpecs(
-                block_size=next(iter(group_specs.values())).block_size,
-                kv_cache_specs=group_specs,
-            ),
-        )
-        for group_specs in (
-            {"layer.attn": specs["layer.attn"]},
-            {"layer.indexer.k_cache": specs["layer.indexer.k_cache"]},
-            {"layer.indexer.compressor.state_cache": specs["layer.indexer.compressor.state_cache"]},
-        )
-    ]
+    groups = get_kv_cache_groups(SimpleNamespace(), specs)
+    assert len(groups) == 2
+    assert groups[0].layer_names == ["layer.attn", "layer.indexer.k_cache"]
+    assert groups[1].layer_names == ["layer.indexer.compressor.state_cache"]
     main_page_size = specs["layer.attn"].page_size_bytes
     small_page_size = specs["layer.indexer.k_cache"].page_size_bytes
     assert small_page_size == specs["layer.indexer.compressor.state_cache"].page_size_bytes
@@ -833,7 +924,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     assert tensors[1].size == small_page_size * num_blocks
 
 
-def test_glm5_memory_accounting_charges_shared_pool_for_every_group():
+def test_glm5_memory_accounting_counts_combined_full_group_once():
     _, groups = _make_glm5_cache_groups(include_mtp=False)
     layout = _get_glm5_cache_layout(groups)
     assert layout is not None
@@ -846,9 +937,13 @@ def test_glm5_memory_accounting_charges_shared_pool_for_every_group():
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
     )
     blocks_needed = sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in groups)
+    full_blocks = layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
     bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
 
     assert _max_memory_usage_bytes_from_groups(vllm_config, groups) == (blocks_needed * bytes_per_block)
+    assert _max_memory_usage_bytes_from_groups(vllm_config, groups) < (
+        (blocks_needed + full_blocks) * bytes_per_block
+    )
 
 
 def test_indexer_kpool_mla_compressed_slot_mapping_only_writes_completed_pools():

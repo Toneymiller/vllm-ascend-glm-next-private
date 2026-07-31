@@ -34,8 +34,7 @@ _orig_max_memory_usage_bytes_from_groups = getattr(
 
 @dataclass(frozen=True)
 class _Glm5CacheLayout:
-    main_group: KVCacheGroupSpec
-    indexer_group: KVCacheGroupSpec
+    full_group: KVCacheGroupSpec
     state_group: KVCacheGroupSpec
     mamba_groups: tuple[KVCacheGroupSpec, ...]
     mla_names: tuple[str, ...]
@@ -74,24 +73,38 @@ def _layer_indices(layer_names: tuple[str, ...]) -> tuple[int, ...] | None:
         return None
 
 
+def _is_glm5_main_spec(spec: KVCacheSpec) -> bool:
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and _is_glm5_spec(spec)
+        and spec.compress_ratio == 1
+    )
+
+
+def _is_glm5_indexer_spec(spec: KVCacheSpec) -> bool:
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and _is_glm5_spec(spec)
+        and spec.compress_ratio > 1
+    )
+
+
+def _is_glm5_state_spec(spec: KVCacheSpec) -> bool:
+    return (
+        isinstance(spec, SlidingWindowMLASpec)
+        and _is_glm5_spec(spec)
+        and getattr(spec, "cache_role", None) == "indexer_state"
+    )
+
+
 def _align_glm5_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
     """Align GLM-5 specs into two physical page-size classes in-place."""
 
-    main_specs = [
-        spec
-        for spec in kv_cache_spec.values()
-        if isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio == 1
-    ]
+    main_specs = [spec for spec in kv_cache_spec.values() if _is_glm5_main_spec(spec)]
     indexer_specs = [
-        spec
-        for spec in kv_cache_spec.values()
-        if isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio > 1
+        spec for spec in kv_cache_spec.values() if _is_glm5_indexer_spec(spec)
     ]
-    state_specs = [
-        spec
-        for spec in kv_cache_spec.values()
-        if getattr(spec, "cache_role", None) == "indexer_state" and _is_glm5_spec(spec)
-    ]
+    state_specs = [spec for spec in kv_cache_spec.values() if _is_glm5_state_spec(spec)]
     mamba_specs = [spec for spec in kv_cache_spec.values() if isinstance(spec, MambaSpec)]
 
     if not main_specs and not indexer_specs and not state_specs:
@@ -116,6 +129,101 @@ def _align_glm5_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
         object.__setattr__(spec, "page_size_padded", small_page_size)
 
 
+def _create_glm5_attention_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Create one full-history group and one indexer-state group for GLM-5."""
+
+    main_names = _sorted_layer_names(
+        [name for name, spec in kv_cache_spec.items() if _is_glm5_main_spec(spec)]
+    )
+    indexer_names = _sorted_layer_names(
+        [name for name, spec in kv_cache_spec.items() if _is_glm5_indexer_spec(spec)]
+    )
+    state_names = _sorted_layer_names(
+        [name for name, spec in kv_cache_spec.items() if _is_glm5_state_spec(spec)]
+    )
+
+    classified_names = {*main_names, *indexer_names, *state_names}
+    if classified_names != set(kv_cache_spec):
+        raise ValueError("GLM-5 KV cache specs contain an unsupported cache role.")
+    if not (len(main_names) == len(indexer_names) == len(state_names) > 0):
+        raise ValueError(
+            "Every GLM-5 MLA layer must own one main MLA, compressed indexer, "
+            "and compressor-state cache."
+        )
+
+    main_indices = _layer_indices(main_names)
+    if main_indices is not None and (
+        main_indices != _layer_indices(indexer_names)
+        or main_indices != _layer_indices(state_names)
+    ):
+        raise ValueError("GLM-5 MLA, indexer, and state cache layer indices do not match.")
+
+    full_block_sizes = {
+        kv_cache_spec[name].block_size for name in (*main_names, *indexer_names)
+    }
+    if len(full_block_sizes) != 1:
+        raise ValueError(
+            "GLM-5 main MLA and compressed indexer caches must use one logical block size."
+        )
+
+    for main_name, indexer_name, state_name in zip(
+        main_names, indexer_names, state_names
+    ):
+        main_spec = kv_cache_spec[main_name]
+        indexer_spec = kv_cache_spec[indexer_name]
+        state_spec = kv_cache_spec[state_name]
+        assert isinstance(main_spec, MLAAttentionSpec)
+        assert isinstance(indexer_spec, MLAAttentionSpec)
+        assert isinstance(state_spec, SlidingWindowMLASpec)
+
+        if main_spec.block_size % indexer_spec.compress_ratio:
+            raise ValueError(
+                "GLM-5 logical block size must be divisible by the indexer "
+                f"compression ratio: block_size={main_spec.block_size}, "
+                f"compress_ratio={indexer_spec.compress_ratio}."
+            )
+        if (
+            state_spec.block_size != indexer_spec.compress_ratio
+            or state_spec.sliding_window != indexer_spec.compress_ratio
+        ):
+            raise ValueError(
+                "GLM-5 indexer state block/window size must equal the paired "
+                f"compression ratio {indexer_spec.compress_ratio}."
+            )
+
+    # Interleave each main/indexer pair while keeping a main spec first. The
+    # scheduler unwraps the first nested spec as the representative, so this
+    # makes it a 128-token FullAttentionManager group. Both physical caches
+    # nevertheless receive the same block IDs from that manager.
+    full_names = [
+        name
+        for main_name, indexer_name in zip(main_names, indexer_names)
+        for name in (main_name, indexer_name)
+    ]
+    full_specs = {name: kv_cache_spec[name] for name in full_names}
+    full_uniform_spec = UniformTypeKVCacheSpecs.from_specs(full_specs)
+    if full_uniform_spec is None:
+        raise ValueError(
+            "GLM-5 main MLA and compressed indexer caches must have uniform "
+            "full-attention block-table semantics."
+        )
+
+    state_specs = {name: kv_cache_spec[name] for name in state_names}
+    state_uniform_spec = UniformTypeKVCacheSpecs.from_specs(state_specs)
+    if state_uniform_spec is None:
+        raise ValueError(
+            "GLM-5 compressor-state caches must have uniform sliding-window "
+            "block-table semantics."
+        )
+
+    return [
+        KVCacheGroupSpec(full_names, full_uniform_spec),
+        KVCacheGroupSpec(list(state_names), state_uniform_spec),
+    ]
+
+
 def _get_glm5_cache_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> _Glm5CacheLayout | None:
@@ -124,8 +232,7 @@ def _get_glm5_cache_layout(
     ):
         return None
 
-    main_groups: list[KVCacheGroupSpec] = []
-    indexer_groups: list[KVCacheGroupSpec] = []
+    full_groups: list[KVCacheGroupSpec] = []
     state_groups: list[KVCacheGroupSpec] = []
     mamba_groups: list[KVCacheGroupSpec] = []
     for group in kv_cache_groups:
@@ -133,33 +240,43 @@ def _get_glm5_cache_layout(
         values = list(specs.values())
         if all(isinstance(spec, MambaSpec) for spec in values):
             mamba_groups.append(group)
-        elif all(
-            isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio == 1 for spec in values
+        elif (
+            all(
+                isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec)
+                for spec in values
+            )
+            and any(_is_glm5_main_spec(spec) for spec in values)
+            and any(_is_glm5_indexer_spec(spec) for spec in values)
         ):
-            main_groups.append(group)
-        elif all(
-            isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec) and spec.compress_ratio > 1 for spec in values
-        ):
-            indexer_groups.append(group)
-        elif all(getattr(spec, "cache_role", None) == "indexer_state" and _is_glm5_spec(spec) for spec in values):
+            full_groups.append(group)
+        elif all(_is_glm5_state_spec(spec) for spec in values):
             state_groups.append(group)
 
-    has_glm5_group = bool(main_groups or indexer_groups or state_groups)
+    has_glm5_group = bool(full_groups or state_groups)
     if not has_glm5_group:
         return None
-    if len(main_groups) != 1 or len(indexer_groups) != 1 or len(state_groups) != 1:
+    if len(full_groups) != 1 or len(state_groups) != 1:
         raise ValueError(
-            "GLM-5 requires exactly one main MLA, one compressed indexer, and one compressor-state KV cache group."
+            "GLM-5 requires exactly one combined main/indexer group and one "
+            "compressor-state KV cache group."
         )
-    classified = len(main_groups) + len(indexer_groups) + len(state_groups) + len(mamba_groups)
+    classified = len(full_groups) + len(state_groups) + len(mamba_groups)
     if classified != len(kv_cache_groups):
         raise ValueError("GLM-5 KV cache groups contain an unsupported cache spec.")
 
-    main_group = main_groups[0]
-    indexer_group = indexer_groups[0]
+    full_group = full_groups[0]
     state_group = state_groups[0]
-    mla_names = _sorted_layer_names(main_group.layer_names)
-    indexer_names = _sorted_layer_names(indexer_group.layer_names)
+    full_specs = full_group.kv_cache_spec.kv_cache_specs
+    mla_names = _sorted_layer_names(
+        [name for name in full_group.layer_names if _is_glm5_main_spec(full_specs[name])]
+    )
+    indexer_names = _sorted_layer_names(
+        [
+            name
+            for name in full_group.layer_names
+            if _is_glm5_indexer_spec(full_specs[name])
+        ]
+    )
     state_names = _sorted_layer_names(state_group.layer_names)
     if not (len(mla_names) == len(indexer_names) == len(state_names)):
         raise ValueError("Every GLM-5 MLA layer must own one compressed indexer and one compressor-state cache.")
@@ -169,8 +286,8 @@ def _get_glm5_cache_layout(
     ):
         raise ValueError("GLM-5 MLA, indexer, and state cache layer indices do not match.")
 
-    main_specs = main_group.kv_cache_spec.kv_cache_specs
-    indexer_specs = indexer_group.kv_cache_spec.kv_cache_specs
+    main_specs = {name: full_specs[name] for name in mla_names}
+    indexer_specs = {name: full_specs[name] for name in indexer_names}
     state_specs = state_group.kv_cache_spec.kv_cache_specs
     main_page_sizes = {spec.page_size_bytes for spec in main_specs.values()} | {
         spec.page_size_bytes for group in mamba_groups for spec in group.kv_cache_spec.kv_cache_specs.values()
@@ -187,8 +304,7 @@ def _get_glm5_cache_layout(
         ]
     )
     return _Glm5CacheLayout(
-        main_group=main_group,
-        indexer_group=indexer_group,
+        full_group=full_group,
         state_group=state_group,
         mamba_groups=sorted_mamba_groups,
         mla_names=mla_names,
@@ -258,9 +374,7 @@ def group_and_unify_kv_cache_specs(
             ratio_specs[spec.compress_ratio][name] = spec
 
     mla_uniform_specs = []
-    is_glm5 = any(_is_glm5_spec(spec) for spec in kv_cache_spec.values())
-    ratio_sort_key = (lambda ratio: (ratio != 1, ratio)) if is_glm5 else (lambda ratio: (ratio != 4, ratio))
-    for ratio in sorted(ratio_specs, key=ratio_sort_key):
+    for ratio in sorted(ratio_specs, key=lambda ratio: (ratio != 4, ratio)):
         spec_dict = ratio_specs[ratio]
         assert len(spec_dict) > 0
         mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(spec_dict))
@@ -294,21 +408,27 @@ def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
-    """Keep GLM-5 Mamba states out of the MLA grouping fast path."""
+    """Build GLM-5's paired full group and packed Mamba subgroups."""
 
     is_glm5 = any(getattr(spec, "model_version", None) == "glm5_next" for spec in kv_cache_spec.values())
     if not is_glm5:
         return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if getattr(scheduler_config, "disable_hybrid_kv_cache_manager", False):
+        raise ValueError(
+            "GLM-5's paired MLA/indexer and sliding state layout requires the "
+            "hybrid KV cache manager."
+        )
+
     _align_glm5_cache_specs(kv_cache_spec)
     mamba_specs = {name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)}
-    if not mamba_specs:
-        # MTP uses a standalone MLA runner. It still needs the same two-page
-        # layout, but has no KDA/Mamba groups to split out.
-        return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-
     attention_specs = {name: spec for name, spec in kv_cache_spec.items() if not isinstance(spec, MambaSpec)}
-    groups = _orig_get_kv_cache_groups(vllm_config, attention_specs)
+    groups = _create_glm5_attention_groups(attention_specs)
+    if not mamba_specs:
+        # The standalone MTP runner has the same paired full group and state
+        # group, but no KDA/Mamba subgroups.
+        return groups
 
     mamba_grouped_names: list[list[str]] = []
     run_pos = 0

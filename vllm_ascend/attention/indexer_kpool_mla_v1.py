@@ -368,9 +368,9 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             )
         if self.enable_dsa_cp:
             raise ValueError("GLM-5 Indexer KPool MLA does not yet support DSA context parallelism.")
-        # Indexer KPool MLA owns three cache groups. SFA's packed-C8 and fused MLA
-        # prolog paths assume one combined MLAAttention cache and therefore
-        # must not reinterpret this layout.
+        # Indexer KPool MLA owns three physical cache roles. Main MLA and the
+        # compressed indexer share one scheduler group, while compressor state
+        # uses another. SFA's fused cache paths must not reinterpret this layout.
         self.use_sparse_c8_indexer = False
         self.use_sparse_c8_sfa = False
         self.enable_sfa_prolog_v3 = False
