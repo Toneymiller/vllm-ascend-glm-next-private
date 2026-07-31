@@ -651,29 +651,18 @@ def _make_glm5_cache_groups(
             num_speculative_blocks=num_speculative_tokens,
         )
 
-    ordered_names = []
-    for layer_idx in range(45):
-        if layer_idx in mla_layer_indices:
-            prefix = f"model.layers.{layer_idx}.self_attn"
-            ordered_names.extend(
-                [
-                    f"{prefix}.attn",
-                    f"{prefix}.indexer.compressor.state_cache",
-                    f"{prefix}.indexer.k_cache",
-                ]
-            )
-        else:
-            ordered_names.append(f"model.layers.{layer_idx}.mamba")
-    if include_mtp:
-        prefix = "model.layers.45.self_attn"
-        ordered_names.extend(
-            [
-                f"{prefix}.attn",
-                f"{prefix}.indexer.compressor.state_cache",
-                f"{prefix}.indexer.k_cache",
-            ]
-        )
-    specs = {name: specs[name] for name in ordered_names}
+    # Match NPUModelRunner.get_kv_cache_spec: attention/cache-role specs are
+    # collected first and all Mamba specs are appended afterward. Grouping
+    # must recover model order rather than depend on this insertion order.
+    first_mamba_pos = next(
+        idx
+        for idx, spec in enumerate(specs.values())
+        if isinstance(spec, MambaSpec)
+    )
+    assert all(
+        isinstance(spec, MambaSpec)
+        for spec in list(specs.values())[first_mamba_pos:]
+    )
     groups = get_kv_cache_groups(SimpleNamespace(), specs)
     return specs, groups
 
@@ -689,6 +678,11 @@ def test_glm5_main_and_indexer_share_one_full_history_group():
     assert len(layout.full_group.layer_names) == 22
     assert len(layout.state_group.layer_names) == 11
     assert [len(group.layer_names) for group in layout.mamba_groups] == [12, 11, 11]
+    assert [group.layer_names for group in layout.mamba_groups] == [
+        [f"model.layers.{layer_idx}.mamba" for layer_idx in range(0, 45, 4)],
+        [f"model.layers.{layer_idx}.mamba" for layer_idx in range(1, 45, 4)],
+        [f"model.layers.{layer_idx}.mamba" for layer_idx in range(2, 45, 4)],
+    ]
 
     full_specs = layout.full_group.kv_cache_spec.kv_cache_specs
     full_ratios = [full_specs[name].compress_ratio for name in layout.full_group.layer_names]

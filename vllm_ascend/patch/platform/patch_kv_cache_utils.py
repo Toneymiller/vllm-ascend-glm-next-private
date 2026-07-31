@@ -404,6 +404,64 @@ def _create_uniform_mamba_groups(
     return groups
 
 
+def _group_glm5_mamba_layer_names(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    mamba_specs: dict[str, MambaSpec],
+) -> list[list[str]]:
+    """Recover GLM-5's recurrent pattern independent of dict insertion order.
+
+    The model runner intentionally collects attention specs before Mamba specs,
+    so iterating ``kv_cache_spec`` directly makes all Mamba layers look like one
+    long run. Instead, reconstruct model-layer order from the layer indices,
+    find the maximum number of consecutive Mamba/KDA layers, and use the same
+    strided grouping strategy as vLLM's generic hybrid-cache grouping.
+    """
+
+    layer_is_mamba: dict[int, bool] = {}
+    mamba_name_by_index: dict[int, str] = {}
+    for name in kv_cache_spec:
+        try:
+            layer_idx = extract_layer_index(name)
+        except ValueError as exc:
+            raise ValueError(
+                "GLM-5 Mamba cache grouping requires layer names with numeric "
+                f"indices, got {name!r}."
+            ) from exc
+
+        is_mamba = name in mamba_specs
+        previous_kind = layer_is_mamba.setdefault(layer_idx, is_mamba)
+        if previous_kind != is_mamba:
+            raise ValueError(
+                "GLM-5 model layer cannot contain both Mamba and MLA cache "
+                f"specs: layer index {layer_idx}."
+            )
+        if is_mamba:
+            if layer_idx in mamba_name_by_index:
+                raise ValueError(
+                    "GLM-5 model layer must own exactly one Mamba cache spec: "
+                    f"layer index {layer_idx}."
+                )
+            mamba_name_by_index[layer_idx] = name
+
+    max_run_length = 0
+    run_length = 0
+    previous_layer_idx: int | None = None
+    for layer_idx in sorted(layer_is_mamba):
+        is_consecutive = previous_layer_idx is not None and layer_idx == previous_layer_idx + 1
+        if layer_is_mamba[layer_idx]:
+            run_length = run_length + 1 if is_consecutive else 1
+            max_run_length = max(max_run_length, run_length)
+        else:
+            run_length = 0
+        previous_layer_idx = layer_idx
+
+    if max_run_length == 0:
+        raise ValueError("GLM-5 Mamba specs were provided but no Mamba layers were found.")
+
+    sorted_mamba_names = [mamba_name_by_index[idx] for idx in sorted(mamba_name_by_index)]
+    return [sorted_mamba_names[i::max_run_length] for i in range(max_run_length)]
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -430,16 +488,10 @@ def get_kv_cache_groups(
         # group, but no KDA/Mamba subgroups.
         return groups
 
-    mamba_grouped_names: list[list[str]] = []
-    run_pos = 0
-    for name in kv_cache_spec:
-        if name not in mamba_specs:
-            run_pos = 0
-            continue
-        if run_pos == len(mamba_grouped_names):
-            mamba_grouped_names.append([])
-        mamba_grouped_names[run_pos].append(name)
-        run_pos += 1
+    mamba_grouped_names = _group_glm5_mamba_layer_names(
+        kv_cache_spec,
+        mamba_specs,
+    )
     # Keep all groups represented as UniformTypeKVCacheSpecs. Otherwise vLLM's
     # allocator falls back to the legacy uniform-page-size path when MambaSpec
     # and UniformTypeKVCacheSpecs coexist, which cannot represent GLM-5's
