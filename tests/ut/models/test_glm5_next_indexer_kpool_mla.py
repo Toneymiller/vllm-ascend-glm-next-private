@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend.attention.indexer_kpool_mla_v1 import (
@@ -59,10 +60,12 @@ from vllm_ascend.patch.platform.patch_glm5_next_config import (
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _create_glm5_attention_groups,
-    _create_uniform_mamba_groups,
+    _create_mamba_groups,
     _get_glm5_cache_layout,
     _get_kv_cache_config_deepseek_v4,
     _max_memory_usage_bytes_from_groups,
+    _max_memory_usage_pages,
+    get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )
 from vllm_ascend.patch.platform.patch_mamba_config import (
@@ -421,7 +424,7 @@ def test_glm5_mamba_config_aligns_prefix_cache_to_contiguous_main_page(
     assert cache_config.mamba_block_size == 384
 
 
-def test_glm5_mamba_groups_use_uniform_type_wrapper():
+def test_glm5_mamba_groups_use_top_level_mamba_spec():
     mamba_specs = {
         f"layer.{layer_idx}": MambaSpec(
             block_size=256,
@@ -432,13 +435,14 @@ def test_glm5_mamba_groups_use_uniform_type_wrapper():
         for layer_idx in (0, 3)
     }
 
-    groups = _create_uniform_mamba_groups(
+    groups = _create_mamba_groups(
         mamba_specs,
         [["layer.0", "layer.3"]],
     )
 
     assert len(groups) == 1
-    assert isinstance(groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+    assert isinstance(groups[0].kv_cache_spec, MambaSpec)
+    assert groups[0].kv_cache_spec == mamba_specs["layer.0"]
     assert groups[0].layer_names == ["layer.0", "layer.3"]
 
 
@@ -708,6 +712,10 @@ def test_glm5_main_and_indexer_share_one_full_history_group():
     assert len(layout.full_group.layer_names) == 22
     assert len(layout.state_group.layer_names) == 11
     assert [len(group.layer_names) for group in layout.mamba_groups] == [12, 11, 11]
+    assert all(
+        isinstance(group.kv_cache_spec, MambaSpec)
+        for group in layout.mamba_groups
+    )
     assert [group.layer_names for group in layout.mamba_groups] == [
         [f"model.layers.{layer_idx}.mamba" for layer_idx in range(0, 45, 4)],
         [f"model.layers.{layer_idx}.mamba" for layer_idx in range(1, 45, 4)],
@@ -822,13 +830,21 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )
-    num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+    config = get_kv_cache_config_from_groups(
         vllm_config,
         groups,
         available_memory=bytes_per_block * 3,
     )
+    num_blocks = config.num_blocks
+    tensors = config.kv_cache_tensors
 
     assert num_blocks == 3
+    assert config.kv_cache_groups is groups
+    mamba_group_ids, mamba_spec = mamba_utils.get_mamba_groups(config)
+    assert mamba_group_ids == [2, 3, 4]
+    assert isinstance(mamba_spec, MambaSpec)
+    assert config.has_mamba_layers
+    assert config.needs_kv_cache_zeroing
     assert len(tensors) == 23
     assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
     assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
@@ -960,7 +976,10 @@ def test_glm5_memory_accounting_counts_combined_full_group_once():
         ),
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
     )
-    blocks_needed = sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in groups)
+    blocks_needed = sum(
+        _max_memory_usage_pages(vllm_config, group.kv_cache_spec)
+        for group in groups
+    )
     full_blocks = layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
     bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
 

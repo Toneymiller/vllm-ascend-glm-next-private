@@ -10,6 +10,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import (
     _approximate_gcd,
+    create_kv_cache_group_specs,
     may_override_num_blocks,
 )
 from vllm.v1.kv_cache_interface import (
@@ -25,6 +26,9 @@ from vllm.v1.kv_cache_interface import (
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = (
+    vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+)
 _orig_max_memory_usage_bytes_from_groups = getattr(
     vllm.v1.core.kv_cache_utils,
     "_max_memory_usage_bytes_from_groups",
@@ -227,20 +231,23 @@ def _create_glm5_attention_groups(
 def _get_glm5_cache_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> _Glm5CacheLayout | None:
-    if not kv_cache_groups or not all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups
-    ):
+    if not kv_cache_groups:
         return None
 
     full_groups: list[KVCacheGroupSpec] = []
     state_groups: list[KVCacheGroupSpec] = []
     mamba_groups: list[KVCacheGroupSpec] = []
     for group in kv_cache_groups:
-        specs = group.kv_cache_spec.kv_cache_specs
-        values = list(specs.values())
-        if all(isinstance(spec, MambaSpec) for spec in values):
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, MambaSpec):
             mamba_groups.append(group)
-        elif (
+            continue
+        if not isinstance(group_spec, UniformTypeKVCacheSpecs):
+            continue
+
+        specs = group_spec.kv_cache_specs
+        values = list(specs.values())
+        if (
             all(
                 isinstance(spec, MLAAttentionSpec) and _is_glm5_spec(spec)
                 for spec in values
@@ -266,6 +273,8 @@ def _get_glm5_cache_layout(
 
     full_group = full_groups[0]
     state_group = state_groups[0]
+    assert isinstance(full_group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    assert isinstance(state_group.kv_cache_spec, UniformTypeKVCacheSpecs)
     full_specs = full_group.kv_cache_spec.kv_cache_specs
     mla_names = _sorted_layer_names(
         [name for name in full_group.layer_names if _is_glm5_main_spec(full_specs[name])]
@@ -289,9 +298,12 @@ def _get_glm5_cache_layout(
     main_specs = {name: full_specs[name] for name in mla_names}
     indexer_specs = {name: full_specs[name] for name in indexer_names}
     state_specs = state_group.kv_cache_spec.kv_cache_specs
-    main_page_sizes = {spec.page_size_bytes for spec in main_specs.values()} | {
-        spec.page_size_bytes for group in mamba_groups for spec in group.kv_cache_spec.kv_cache_specs.values()
+    mamba_page_sizes = {
+        group.kv_cache_spec.page_size_bytes for group in mamba_groups
     }
+    main_page_sizes = {
+        spec.page_size_bytes for spec in main_specs.values()
+    } | mamba_page_sizes
     small_page_sizes = {spec.page_size_bytes for spec in (*indexer_specs.values(), *state_specs.values())}
     if len(main_page_sizes) != 1 or len(small_page_sizes) != 1:
         raise ValueError("GLM-5 cache specs were not aligned to two physical page sizes.")
@@ -430,19 +442,18 @@ def group_and_unify_kv_cache_specs(
     return [*mla_uniform_specs, *swa_uniform_specs]
 
 
-def _create_uniform_mamba_groups(
+def _create_mamba_groups(
     mamba_specs: dict[str, MambaSpec],
     grouped_layer_names: list[list[str]],
 ) -> list[KVCacheGroupSpec]:
-    groups = []
-    for layer_names in grouped_layer_names:
-        layer_names = list(_sorted_layer_names(layer_names))
-        layer_specs = {name: mamba_specs[name] for name in layer_names}
-        uniform_spec = UniformTypeKVCacheSpecs.from_specs(layer_specs)
-        if uniform_spec is None:
-            raise ValueError("GLM-5 Mamba layers in one KV cache group must have uniform block-table semantics.")
-        groups.append(KVCacheGroupSpec(layer_names, uniform_spec))
-    return groups
+    sorted_groups = [
+        list(_sorted_layer_names(layer_names))
+        for layer_names in grouped_layer_names
+    ]
+    # Use the same representation as upstream Qwen3.5 GDN: each packed
+    # recurrent group has one merged, top-level MambaSpec. Worker helpers can
+    # then recognize it without unwrapping an allocator-specific container.
+    return create_kv_cache_group_specs(mamba_specs, sorted_groups)
 
 
 def _group_glm5_mamba_layer_names(
@@ -533,11 +544,7 @@ def get_kv_cache_groups(
         kv_cache_spec,
         mamba_specs,
     )
-    # Keep all groups represented as UniformTypeKVCacheSpecs. Otherwise vLLM's
-    # allocator falls back to the legacy uniform-page-size path when MambaSpec
-    # and UniformTypeKVCacheSpecs coexist, which cannot represent GLM-5's
-    # independently sized KDA/MLA/Indexer pages.
-    groups.extend(_create_uniform_mamba_groups(mamba_specs, mamba_grouped_names))
+    groups.extend(_create_mamba_groups(mamba_specs, mamba_grouped_names))
     return groups
 
 
@@ -736,6 +743,43 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Dispatch GLM-5's mixed outer specs to its two-page allocator."""
+    if _get_glm5_cache_layout(kv_cache_groups) is None:
+        return _orig_get_kv_cache_config_from_groups(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+
+    num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+
+def _max_memory_usage_pages(
+    vllm_config: VllmConfig,
+    kv_cache_spec: KVCacheSpec,
+) -> int:
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        return kv_cache_spec.max_memory_usage_pages(vllm_config)
+    return cdiv(
+        kv_cache_spec.max_memory_usage_bytes(vllm_config),
+        kv_cache_spec.page_size_bytes,
+    )
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -755,12 +799,18 @@ def _max_memory_usage_bytes_from_groups(
         glm5_layout.main_slot_count * glm5_layout.main_page_size
         + glm5_layout.small_slot_count * glm5_layout.small_page_size
     )
-    blocks_needed = sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in kv_cache_groups)
+    blocks_needed = sum(
+        _max_memory_usage_pages(vllm_config, group.kv_cache_spec)
+        for group in kv_cache_groups
+    )
     return bytes_per_block * blocks_needed
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = (
+    get_kv_cache_config_from_groups
+)
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 # Patch the allocator entry point that the installed upstream actually calls.
