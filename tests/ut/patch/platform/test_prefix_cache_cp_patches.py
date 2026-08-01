@@ -250,16 +250,19 @@ def test_get_effective_block_size(
     assert coordinator._get_effective_block_size(spec_factory()) == expected
 
 
-def test_glm5_combined_full_group_uses_384_token_scheduler_boundaries() -> None:
+@pytest.mark.parametrize("full_block_size", [128, 384])
+def test_glm5_hashes_use_state_granularity_after_engine_min_block_update(
+    full_block_size: int,
+) -> None:
     main_spec = MLAAttentionSpec(
-        block_size=384,
+        block_size=full_block_size,
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
         model_version="glm5_next",
     )
     indexer_spec = MLAAttentionSpec(
-        block_size=384,
+        block_size=full_block_size,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
@@ -280,8 +283,18 @@ def test_glm5_combined_full_group_uses_384_token_scheduler_boundaries() -> None:
     state_group_spec = UniformTypeKVCacheSpecs.from_specs(
         {"layer.state": state_spec}
     )
+    mamba_spec = MambaSpec(
+        block_size=full_block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    mamba_group_spec = UniformTypeKVCacheSpecs.from_specs(
+        {"layer.mamba": mamba_spec}
+    )
     assert full_group_spec is not None
     assert state_group_spec is not None
+    assert mamba_group_spec is not None
 
     worker_config = KVCacheConfig(
         num_blocks=10,
@@ -294,6 +307,10 @@ def test_glm5_combined_full_group_uses_384_token_scheduler_boundaries() -> None:
             KVCacheGroupSpec(
                 layer_names=["layer.state"],
                 kv_cache_spec=state_group_spec,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["layer.mamba"],
+                kv_cache_spec=mamba_group_spec,
             ),
         ],
     )
@@ -308,30 +325,45 @@ def test_glm5_combined_full_group_uses_384_token_scheduler_boundaries() -> None:
     assert isinstance(scheduler_full_spec, MLAAttentionSpec)
     assert scheduler_full_spec.head_size == main_spec.head_size
     assert scheduler_full_spec.compress_ratio == 1
-    assert coordinator._get_effective_block_size(scheduler_full_spec) == 384
+    assert coordinator._get_effective_block_size(scheduler_full_spec) == full_block_size
 
     vllm_config = _make_vllm_config(
         enable_prefix_caching=True,
         dcp=1,
         pcp=1,
-        block_size=384,
+        block_size=full_block_size,
     )
+    # Match EngineCore._initialize_kv_caches: after scheduler specs are
+    # unwrapped, the global cache block size becomes the smallest group size.
+    # This must not make the aligned Mamba group look unaligned.
+    vllm_config.cache_config.block_size = min(
+        group.kv_cache_spec.block_size for group in scheduler_config.kv_cache_groups
+    )
+    assert vllm_config.cache_config.block_size == 16
     vllm_config.cache_config.hash_block_size = None
     vllm_config.kv_transfer_config = None
     scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
         scheduler_config,
         vllm_config,
     )
-    assert (scheduler_block_size, hash_block_size) == (384, 16)
+    assert (scheduler_block_size, hash_block_size) == (
+        full_block_size,
+        16,
+    )
 
-    base_hashes = [bytes([i]) for i in range(48)]
+    hashes_per_full_block = full_block_size // hash_block_size
+    base_hashes = [bytes([i]) for i in range(2 * hashes_per_full_block)]
     full_group_hashes = BlockHashListWithBlockSize(
         base_hashes,
         hash_block_size,
         scheduler_full_spec.block_size,
     )
     assert len(full_group_hashes) == 2
-    assert full_group_hashes[0] == b"".join(base_hashes[:24])
+    assert full_group_hashes[0] == b"".join(base_hashes[:hashes_per_full_block])
+    assert (
+        scheduler_config.kv_cache_groups[1].kv_cache_spec.block_size
+        == hash_block_size
+    )
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

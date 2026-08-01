@@ -341,11 +341,52 @@ def _ascend_resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
+    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    has_glm5_group = any(
+        _is_glm5_spec(nested_spec)
+        for group in groups
+        for nested_spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    )
+    if has_glm5_group:
+        # EngineCore rewrites cache_config.block_size to the minimum scheduler
+        # group block size after unwrapping UniformTypeKVCacheSpecs. For GLM-5
+        # that minimum is the indexer-state block (R), not the aligned full /
+        # Mamba block. The upstream "Mamba block != cache block" fallback then
+        # incorrectly disables fine-grained hashes and returns the scheduler
+        # LCM as hash_block_size. A state block cannot split such a coarse hash.
+        scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
+        connector_enabled = (
+            getattr(vllm_config, "kv_transfer_config", None) is not None
+        )
+        if not (cache_config.enable_prefix_caching or connector_enabled):
+            return scheduler_block_size, scheduler_block_size
+
+        requested_hash_block_size = getattr(
+            cache_config,
+            "hash_block_size",
+            None,
+        )
+        hash_block_size = (
+            requested_hash_block_size
+            if requested_hash_block_size is not None
+            else math.gcd(*group_block_sizes)
+        )
+        if any(block_size % hash_block_size for block_size in group_block_sizes):
+            raise ValueError(
+                f"Invalid hash_block_size={hash_block_size}; all GLM-5 KV "
+                "cache group block sizes must be divisible by it. "
+                f"Got group block sizes={group_block_sizes}."
+            )
+        return scheduler_block_size, hash_block_size
+
     if dcp != 1 or pcp != 1:
         # Ascend supports CP with multiple KV cache groups; compute
         # scheduler_block_size using the LCM of all group block sizes
         # multiplied by the CP factors for proper alignment.
-        group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
         scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
         if not cache_config.enable_prefix_caching:
             return scheduler_block_size, scheduler_block_size
