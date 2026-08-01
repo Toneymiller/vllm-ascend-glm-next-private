@@ -11,6 +11,7 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -32,6 +33,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
+GLM5_SFA_KERNEL_BLOCK_SIZE = 128
 
 
 @dataclass
@@ -92,6 +94,15 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         self.logical_block_size = kv_cache_spec.block_size
         self.storage_block_size = kv_cache_spec.storage_block_size
         self.compress_ratio = kv_cache_spec.compress_ratio
+        if self.logical_block_size % GLM5_SFA_KERNEL_BLOCK_SIZE:
+            raise ValueError(
+                "GLM-5 logical block size must be divisible by the SFA "
+                f"kernel block size: logical={self.logical_block_size}, "
+                f"kernel={GLM5_SFA_KERNEL_BLOCK_SIZE}."
+            )
+        self.kernel_blocks_per_logical_block = (
+            self.logical_block_size // GLM5_SFA_KERNEL_BLOCK_SIZE
+        )
         scheduler_config = vllm_config.scheduler_config
         # ACLGraph replay keeps the addresses captured on the first run. The
         # derived compressed metadata therefore needs persistent storage that
@@ -103,6 +114,16 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         )
         self._seq_lens_buffer = torch.empty(
             scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        max_logical_blocks = cdiv(
+            vllm_config.model_config.max_model_len,
+            self.logical_block_size,
+        )
+        self._block_table_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            max_logical_blocks,
             dtype=torch.int32,
             device=device,
         )
@@ -144,8 +165,37 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             self.compress_ratio,
             rounding_mode="floor",
         )
+        expanded_block_table = common_attn_metadata.block_table_tensor[
+            :num_reqs
+        ]
+        split = self.kernel_blocks_per_logical_block
+        if expanded_block_table.shape[1] % split:
+            raise ValueError(
+                "GLM-5 indexer received a partially expanded SFA block "
+                f"table: width={expanded_block_table.shape[1]}, split={split}."
+            )
+        logical_width = expanded_block_table.shape[1] // split
+        if logical_width > self._block_table_buffer.shape[1]:
+            raise ValueError(
+                "GLM-5 indexer block table exceeds its persistent buffer: "
+                f"required={logical_width}, capacity="
+                f"{self._block_table_buffer.shape[1]}."
+            )
+        block_table = self._block_table_buffer[
+            :num_reqs, :logical_width
+        ]
+        # The common full-group table is expanded for the C128 SFA kernel:
+        # scheduler block N becomes [split*N, ..., split*N+split-1]. The
+        # compressed indexer owns one physical page per scheduler block, so it
+        # must recover N rather than treating the SFA sub-blocks as pages.
+        torch.div(
+            expanded_block_table[:, ::split],
+            split,
+            rounding_mode="floor",
+            out=block_table,
+        )
         return AscendIndexerKPoolMetadata(
-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
+            block_table=block_table,
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
@@ -350,7 +400,7 @@ class AscendIndexerKPoolMLABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
-        return [128]
+        return [GLM5_SFA_KERNEL_BLOCK_SIZE]
 
 
 class AscendIndexerKPoolMLAImpl(AscendSFAImpl):

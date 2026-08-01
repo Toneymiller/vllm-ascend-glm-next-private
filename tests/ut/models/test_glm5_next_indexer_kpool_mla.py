@@ -27,6 +27,7 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.attention.indexer_kpool_mla_v1 import (
     AscendIndexerKPoolBackend,
     AscendIndexerKPoolMetadataBuilder,
+    AscendIndexerKPoolMLABackend,
     AscendIndexerKPoolMLAImpl,
     AscendIndexerKPoolMLAMetadataBuilder,
     AscendIndexerKPoolStateBackend,
@@ -65,8 +66,9 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     get_kv_cache_groups,
 )
 from vllm_ascend.patch.platform.patch_mamba_config import (
-    GLM5_LOGICAL_BLOCK_SIZE,
+    GLM5_KERNEL_BLOCK_SIZE,
     _get_mamba_target_page_size,
+    _is_glm5_next_model,
 )
 from vllm_ascend.patch.worker.patch_process_weights_after_loading import (
     _is_ascend_attention,
@@ -195,7 +197,7 @@ def test_indexer_kpool_state_uses_independent_backend_for_four_token_pages():
 
 def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     spec = MLAAttentionSpec(
-        block_size=128,
+        block_size=384,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
@@ -209,46 +211,61 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=16,
                 max_num_seqs=4,
-            )
+            ),
+            model_config=SimpleNamespace(max_model_len=768),
         ),
         torch.device("cpu"),
     )
     common_metadata = SimpleNamespace(
         num_reqs=1,
         num_input_tokens=4,
-        positions=torch.tensor([0, 1, 2, 3]),
-        slot_mapping=torch.tensor([7 * 128 + offset for offset in range(4)]),
-        seq_lens=torch.tensor([4], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
+        positions=torch.tensor([380, 381, 382, 383]),
+        slot_mapping=torch.tensor([7 * 384 + offset for offset in range(380, 384)]),
+        seq_lens=torch.tensor([384], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([384], dtype=torch.int32),
         seq_lens_cpu=None,
-        block_table_tensor=torch.tensor([[7]], dtype=torch.int32),
+        block_table_tensor=torch.tensor(
+            [[21, 22, 23, 6, 7, 8]],
+            dtype=torch.int32,
+        ),
     )
 
     metadata = builder.build(0, common_metadata)
 
     assert not issubclass(AscendIndexerKPoolMetadataBuilder, AscendSFAMetadataBuilder)
     assert AscendGlm5NextIndexerKPoolCache.get_attn_backend(None) is AscendIndexerKPoolBackend
-    assert select_common_block_size(128, [AscendIndexerKPoolBackend]) == 128
-    assert metadata.block_size == 32
-    assert metadata.slot_mapping.tolist() == [-1, -1, -1, 7 * 32]
-    assert metadata.seq_lens.tolist() == [1]
-    assert metadata.seq_lens_cpu.tolist() == [1]
-    assert metadata.block_table.tolist() == [[7]]
+    assert (
+        select_common_block_size(
+            384,
+            [AscendIndexerKPoolMLABackend, AscendIndexerKPoolBackend],
+        )
+        == 128
+    )
+    assert metadata.block_size == 96
+    assert metadata.block_table.tolist() == [[7, 2]]
+    assert metadata.slot_mapping.tolist() == [-1, -1, -1, 7 * 96 + 95]
+    assert metadata.seq_lens.tolist() == [96]
+    assert metadata.seq_lens_cpu.tolist() == [96]
 
     first_slot_mapping_ptr = metadata.slot_mapping.data_ptr()
     first_seq_lens_ptr = metadata.seq_lens.data_ptr()
+    first_block_table_ptr = metadata.block_table.data_ptr()
     common_metadata.positions = torch.tensor([4, 5, 6, 7])
-    common_metadata.slot_mapping = torch.tensor([9 * 128 + offset for offset in range(4, 8)])
+    common_metadata.slot_mapping = torch.tensor(
+        [3 * 384 + offset for offset in range(4, 8)]
+    )
     common_metadata.seq_lens = torch.tensor([8], dtype=torch.int32)
     common_metadata._seq_lens_cpu = torch.tensor([8], dtype=torch.int32)
-    common_metadata.block_table_tensor = torch.tensor([[9]], dtype=torch.int32)
+    common_metadata.block_table_tensor = torch.tensor([[9, 10, 11]], dtype=torch.int32)
 
     replay_metadata = builder.build(0, common_metadata)
 
     assert replay_metadata.slot_mapping.data_ptr() == first_slot_mapping_ptr
     assert replay_metadata.seq_lens.data_ptr() == first_seq_lens_ptr
-    assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 9 * 32 + 1]
+    assert replay_metadata.block_table.data_ptr() == first_block_table_ptr
+    assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 3 * 96 + 1]
     assert replay_metadata.seq_lens.tolist() == [2]
+    assert replay_metadata.block_table.tolist() == [[3]]
 
 
 def test_glm5_latest_config_schema_drives_attention_and_mlp_layout():
@@ -303,29 +320,42 @@ def test_glm5_model_arch_config_uses_mla_cache_dimensions():
     assert model_arch_config.head_size == 512
 
 
-def test_glm5_kda_page_covers_ssm_and_conv_states():
+def test_glm5_kda_page_is_padded_to_contiguous_main_mla_page():
     target_page_size = _get_mamba_target_page_size(
         is_glm5_next=True,
-        attn_page_size=262144,
+        attn_page_size=393216,
         mamba_raw_size=271360,
         conv_block_page_size=9216,
     )
 
-    assert target_page_size == 271360
+    assert target_page_size == 393216
 
 
-def test_glm5_logical_block_size_is_not_inflated_to_physical_page():
-    assert GLM5_LOGICAL_BLOCK_SIZE == 128
-    physical_page_size = 271360
+def test_glm5_logical_block_makes_main_mla_page_contiguous():
+    logical_block_size = 384
+    physical_page_size = 393216
     mla_payload_size = (
-        GLM5_LOGICAL_BLOCK_SIZE
+        logical_block_size
         * 1
         * 512
         * torch.bfloat16.itemsize
     )
 
-    assert mla_payload_size == 131072
-    assert physical_page_size > mla_payload_size
+    assert GLM5_KERNEL_BLOCK_SIZE == 128
+    assert logical_block_size % GLM5_KERNEL_BLOCK_SIZE == 0
+    assert mla_payload_size == physical_page_size
+
+
+@pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
+def test_glm5_model_type_detection_accepts_outer_and_text_configs(
+    model_type: str,
+):
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type=model_type),
+        hf_text_config=SimpleNamespace(model_type=model_type),
+    )
+
+    assert _is_glm5_next_model(model_config)
 
 
 @patch(
@@ -336,7 +366,7 @@ def test_glm5_logical_block_size_is_not_inflated_to_physical_page():
     "vllm_ascend.patch.platform.patch_mamba_config."
     "ModelRegistry.resolve_model_cls"
 )
-def test_glm5_mamba_config_keeps_128_token_logical_block(
+def test_glm5_mamba_config_aligns_prefix_cache_to_contiguous_main_page(
     mock_resolve_model_cls,
     mock_mamba_verify,
 ):
@@ -353,11 +383,11 @@ def test_glm5_mamba_config_keeps_128_token_logical_block(
 
     mock_resolve_model_cls.return_value = FakeGlm5Model, None
     cache_config = SimpleNamespace(
-        block_size=512,
+        block_size=128,
         cache_dtype="auto",
         mamba_page_size_padded=None,
-        enable_prefix_caching=False,
-        mamba_cache_mode="none",
+        enable_prefix_caching=True,
+        mamba_cache_mode="align",
         mamba_block_size=None,
     )
     model_config = SimpleNamespace(
@@ -386,9 +416,9 @@ def test_glm5_mamba_config_keeps_128_token_logical_block(
     HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
 
     mock_mamba_verify.assert_called_once_with(vllm_config)
-    assert cache_config.block_size == GLM5_LOGICAL_BLOCK_SIZE
-    assert cache_config.mamba_page_size_padded == 271360
-    assert cache_config.mamba_block_size == model_config.max_model_len
+    assert cache_config.block_size == 384
+    assert cache_config.mamba_page_size_padded == 393216
+    assert cache_config.mamba_block_size == 384
 
 
 def test_glm5_mamba_groups_use_uniform_type_wrapper():
@@ -617,14 +647,14 @@ def _make_glm5_cache_groups(
     for layer_idx in mla_layer_indices:
         prefix = f"model.layers.{layer_idx}.self_attn"
         specs[f"{prefix}.attn"] = MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=512,
             dtype=torch.bfloat16,
             model_version="glm5_next",
         )
         specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
@@ -642,7 +672,7 @@ def _make_glm5_cache_groups(
         )
     for layer_idx in mamba_layer_indices:
         specs[f"model.layers.{layer_idx}.mamba"] = MambaSpec(
-            block_size=128,
+            block_size=384,
             shapes=(
                 (3 + num_speculative_tokens, 1536),
                 (4, 128, 128),
@@ -687,12 +717,12 @@ def test_glm5_main_and_indexer_share_one_full_history_group():
     full_specs = layout.full_group.kv_cache_spec.kv_cache_specs
     full_ratios = [full_specs[name].compress_ratio for name in layout.full_group.layer_names]
     assert full_ratios == [ratio for _ in range(11) for ratio in (1, 16)]
-    assert layout.full_group.kv_cache_spec.block_size == 128
+    assert layout.full_group.kv_cache_spec.block_size == 384
     assert layout.state_group.kv_cache_spec.block_size == 16
     assert {
         full_specs[name].storage_block_size
         for name in layout.indexer_names
-    } == {8}
+    } == {24}
 
     layer_to_group_id = {
         layer_name: group_id
@@ -717,15 +747,15 @@ def test_glm5_main_and_indexer_share_one_full_history_group():
             prefill_context_parallel_size=1,
         ),
     )
-    # One FullAttentionManager/block table reserves eight 128-token IDs for
-    # both physical caches instead of reserving eight IDs per cache role.
-    assert layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config) == 8
+    # One FullAttentionManager/block table reserves three 384-token IDs for
+    # both physical caches instead of reserving three IDs per cache role.
+    assert layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config) == 3
     first_main, first_indexer = layout.full_group.layer_names[:2]
     assert [
         full_specs[name].max_memory_usage_bytes(vllm_config)
         // full_specs[name].page_size_bytes
         for name in (first_main, first_indexer)
-    ] == [8, 8]
+    ] == [3, 3]
 
 
 @pytest.mark.parametrize(
@@ -744,14 +774,14 @@ def test_glm5_combined_group_validates_compression_geometry(
 ):
     specs = {
         "model.layers.0.self_attn.attn": MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=512,
             dtype=torch.bfloat16,
             model_version="glm5_next",
         ),
         "model.layers.0.self_attn.indexer.k_cache": MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
@@ -785,7 +815,7 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
         for spec in specs.values()
         if isinstance(spec, (MLAAttentionSpec, MambaSpec)) and getattr(spec, "compress_ratio", 1) == 1
     )
-    assert layout.main_page_size == 271360
+    assert layout.main_page_size == 384 * 512 * 2
     assert layout.small_page_size == 16 * 256 * 2
 
     bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
@@ -844,7 +874,7 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
     ]
 
 
-def test_glm5_target_mtp5_keeps_slot_counts_and_expands_kda_page():
+def test_glm5_target_mtp5_keeps_kda_padded_to_main_page():
     specs, groups = _make_glm5_cache_groups(
         include_mtp=False,
         num_speculative_tokens=5,
@@ -854,7 +884,7 @@ def test_glm5_target_mtp5_keeps_slot_counts_and_expands_kda_page():
 
     assert layout.main_slot_count == 12
     assert layout.small_slot_count == 11
-    assert layout.main_page_size == 286720
+    assert layout.main_page_size == 384 * 512 * 2
     assert {
         spec.num_speculative_blocks
         for spec in specs.values()
@@ -865,14 +895,14 @@ def test_glm5_target_mtp5_keeps_slot_counts_and_expands_kda_page():
 def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     specs = {
         "layer.attn": MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,
             model_version="glm5_next",
         ),
         "layer.indexer.k_cache": MLAAttentionSpec(
-            block_size=128,
+            block_size=384,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,

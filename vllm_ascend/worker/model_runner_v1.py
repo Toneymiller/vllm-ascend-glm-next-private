@@ -217,6 +217,14 @@ def _is_glm5_indexer_kpool_cache_spec(spec: KVCacheSpec) -> bool:
     ) or isinstance(spec, AscendIndexerKPoolStateSpec)
 
 
+def _is_glm5_main_mla_cache_spec(spec: KVCacheSpec) -> bool:
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and spec.model_version == "glm5_next"
+        and spec.compress_ratio == 1
+    )
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -4431,6 +4439,39 @@ class NPUModelRunner(GPUModelRunner):
                         // current_kv_cache_spec.page_size_bytes
                     )
                     assert num_blocks >= kv_cache_config.num_blocks
+                    if _is_glm5_main_mla_cache_spec(
+                        current_kv_cache_spec
+                    ):
+                        kernel_block_size = select_common_block_size(
+                            current_kv_cache_spec.block_size,
+                            [attn_backend],
+                        )
+                        blocks_per_scheduler_block = (
+                            current_kv_cache_spec.block_size
+                            // kernel_block_size
+                        )
+                        if (
+                            current_kv_cache_spec.page_size_bytes
+                            != current_kv_cache_spec.real_page_size_bytes
+                        ):
+                            raise ValueError(
+                                "GLM-5 main MLA must define the complete "
+                                "large physical page before virtual block "
+                                "splitting: real_page_size_bytes="
+                                f"{current_kv_cache_spec.real_page_size_bytes}, "
+                                "page_size_bytes="
+                                f"{current_kv_cache_spec.page_size_bytes}."
+                            )
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks * blocks_per_scheduler_block,
+                            kernel_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                        kv_caches[layer_name] = raw_tensor.view(
+                            current_kv_cache_spec.dtype
+                        ).view(cache_shape)
+                        continue
                     is_quantized_indexer_cache = (
                         isinstance(current_kv_cache_spec, MLAAttentionSpec)
                         and current_kv_cache_spec.compress_ratio > 1

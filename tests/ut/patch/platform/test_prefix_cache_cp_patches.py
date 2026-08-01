@@ -204,7 +204,7 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
         ),
         pytest.param(
             lambda: MLAAttentionSpec(
-                block_size=128,
+                block_size=384,
                 num_kv_heads=1,
                 head_size=128,
                 dtype=torch.bfloat16,
@@ -214,7 +214,7 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
             1,
             1,
             True,
-            128,
+            384,
             id="glm5-indexer-keeps-full-history-block-size",
         ),
         pytest.param(
@@ -250,16 +250,16 @@ def test_get_effective_block_size(
     assert coordinator._get_effective_block_size(spec_factory()) == expected
 
 
-def test_glm5_combined_full_group_uses_128_token_prefix_boundaries() -> None:
+def test_glm5_combined_full_group_uses_384_token_scheduler_boundaries() -> None:
     main_spec = MLAAttentionSpec(
-        block_size=128,
+        block_size=384,
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
         model_version="glm5_next",
     )
     indexer_spec = MLAAttentionSpec(
-        block_size=128,
+        block_size=384,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
@@ -308,13 +308,13 @@ def test_glm5_combined_full_group_uses_128_token_prefix_boundaries() -> None:
     assert isinstance(scheduler_full_spec, MLAAttentionSpec)
     assert scheduler_full_spec.head_size == main_spec.head_size
     assert scheduler_full_spec.compress_ratio == 1
-    assert coordinator._get_effective_block_size(scheduler_full_spec) == 128
+    assert coordinator._get_effective_block_size(scheduler_full_spec) == 384
 
     vllm_config = _make_vllm_config(
         enable_prefix_caching=True,
         dcp=1,
         pcp=1,
-        block_size=128,
+        block_size=384,
     )
     vllm_config.cache_config.hash_block_size = None
     vllm_config.kv_transfer_config = None
@@ -322,16 +322,16 @@ def test_glm5_combined_full_group_uses_128_token_prefix_boundaries() -> None:
         scheduler_config,
         vllm_config,
     )
-    assert (scheduler_block_size, hash_block_size) == (128, 16)
+    assert (scheduler_block_size, hash_block_size) == (384, 16)
 
-    base_hashes = [bytes([i]) for i in range(16)]
+    base_hashes = [bytes([i]) for i in range(48)]
     full_group_hashes = BlockHashListWithBlockSize(
         base_hashes,
         hash_block_size,
         scheduler_full_spec.block_size,
     )
     assert len(full_group_hashes) == 2
-    assert full_group_hashes[0] == b"".join(base_hashes[:8])
+    assert full_group_hashes[0] == b"".join(base_hashes[:24])
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

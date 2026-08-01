@@ -5,8 +5,19 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from vllm.model_executor.layers.attention import MLAAttention
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 
+from vllm_ascend.attention.indexer_kpool_mla_v1 import (
+    AscendIndexerKPoolBackend,
+    AscendIndexerKPoolMLABackend,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -90,8 +101,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
     def test_reshape_padded_glm5_cache_uses_physical_page_stride(self):
         cases = (
-            ((2, 128, 1, 512), 271360),
-            ((2, 8, 1, 128), 8192),
+            ((2, 3, 1536), 393216),
+            ((2, 24, 1, 128), 8192),
         )
         for cache_shape, page_size_bytes in cases:
             with self.subTest(cache_shape=cache_shape):
@@ -117,11 +128,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     page_size_bytes,
                 )
 
-    def test_reshape_padded_glm5_cache_matches_reported_runtime_shape(self):
+    def test_reshape_padded_glm5_indexer_matches_runtime_shape(self):
         num_blocks = 995
-        block_size = 128
-        head_size = 512
-        page_size_bytes = 271360
+        storage_block_size = 24
+        head_size = 128
+        page_size_bytes = 8192
         raw_tensor = torch.empty(
             num_blocks * page_size_bytes,
             dtype=torch.uint8,
@@ -130,16 +141,91 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         cache = NPUModelRunner._reshape_padded_cache_tensor(
             raw_tensor,
-            (num_blocks, block_size, 1, head_size),
+            (num_blocks, storage_block_size, 1, head_size),
             torch.bfloat16,
             page_size_bytes,
         )
 
-        self.assertEqual(cache.shape, (995, 128, 1, 512))
+        self.assertEqual(cache.shape, (995, 24, 1, 128))
         self.assertEqual(
             cache.stride(0),
             page_size_bytes // torch.bfloat16.itemsize,
         )
+
+    def test_glm5_main_mla_uses_contiguous_c128_kernel_pages(self):
+        runner = self._build_runner()
+        main_name = "model.layers.3.self_attn.attn"
+        indexer_name = "model.layers.3.self_attn.indexer.k_cache"
+        main_spec = MLAAttentionSpec(
+            block_size=384,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            page_size_padded=393216,
+            model_version="glm5_next",
+        )
+        indexer_spec = MLAAttentionSpec(
+            block_size=384,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            page_size_padded=24576,
+            compress_ratio=4,
+            model_version="glm5_next",
+        )
+        full_spec = UniformTypeKVCacheSpecs.from_specs(
+            {
+                main_name: main_spec,
+                indexer_name: indexer_spec,
+            }
+        )
+        self.assertIsNotNone(full_spec)
+        assert full_spec is not None
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[main_name, indexer_name],
+                    kv_cache_spec=full_spec,
+                )
+            ],
+        )
+        main_backend = AscendIndexerKPoolMLABackend
+        indexer_backend = AscendIndexerKPoolBackend
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=main_spec,
+                backend=main_backend,
+                layer_names=[main_name],
+            ),
+            SimpleNamespace(
+                kv_cache_spec=indexer_spec,
+                backend=indexer_backend,
+                layer_names=[indexer_name],
+            ),
+        ]
+        raw_tensors = {
+            main_name: torch.empty(
+                2 * main_spec.page_size_bytes,
+                dtype=torch.uint8,
+            ),
+            indexer_name: torch.empty(
+                2 * indexer_spec.page_size_bytes,
+                dtype=torch.uint8,
+            ),
+        }
+
+        caches = runner._reshape_kv_cache_tensors(
+            kv_cache_config,
+            raw_tensors,
+        )
+
+        main_cache = caches[main_name]
+        indexer_cache = caches[indexer_name]
+        self.assertEqual(main_cache.shape, (6, 128, 1, 512))
+        self.assertTrue(main_cache.is_contiguous())
+        self.assertEqual(indexer_cache.shape, (2, 96, 1, 128))
 
     def test_reshape_padded_glm5_mamba_states_stay_within_each_page(self):
         raw_tensor = torch.empty(2 * 64, dtype=torch.uint8)

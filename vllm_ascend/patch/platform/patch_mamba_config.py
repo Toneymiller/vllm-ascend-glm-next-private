@@ -8,7 +8,19 @@ from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
-GLM5_LOGICAL_BLOCK_SIZE = 128
+GLM5_KERNEL_BLOCK_SIZE = 128
+
+
+def _is_glm5_next_model(model_config) -> bool:
+    model_types = {
+        getattr(getattr(model_config, "hf_config", None), "model_type", None),
+        getattr(
+            getattr(model_config, "hf_text_config", None),
+            "model_type",
+            None,
+        ),
+    }
+    return bool(model_types & {"glm5_next", "glm5_next_text"})
 
 
 def _using_kv_store(vllm_config) -> bool:
@@ -37,9 +49,9 @@ def _get_mamba_target_page_size(
     conv_block_page_size: int,
 ) -> int:
     if is_glm5_next:
-        # GLM5-Next 的 Mamba/KDA cache 与各个 Indexer/MLA cache 分组后独立
-        # 分配，不要求物理 page 字节数相同。但 MambaSpec 的一个 page 必须
-        # 能容纳完整的 SSM + conv state，不能只按最大的 SSM state 计算。
+        # GLM5-Next packs main MLA and Mamba/KDA layers into the same large
+        # physical tensor slots. One page must therefore cover both the full
+        # attention payload and the complete SSM + conv state.
         return max(attn_page_size, mamba_raw_size)
     return attn_page_size + conv_block_page_size
 
@@ -66,26 +78,14 @@ def verify_and_update_config(cls, vllm_config) -> None:
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
-    is_glm5_next = model_config.hf_config.model_type == "glm5_next"
-
-    # GLM-5 uses two independently padded physical page classes. Its logical
-    # MLA block size must therefore not be enlarged to the KDA state size by
-    # the generic hybrid-model policy. The MLA backend and Indexer compression
-    # metadata both use a 128-token logical block; only page_size_padded grows.
-    if is_glm5_next and cache_config.block_size != GLM5_LOGICAL_BLOCK_SIZE:
-        logger.info(
-            "Setting GLM-5 logical attention block size to %d tokens; "
-            "KDA state alignment is handled by physical page padding.",
-            GLM5_LOGICAL_BLOCK_SIZE,
-        )
-        cache_config.block_size = GLM5_LOGICAL_BLOCK_SIZE
+    is_glm5_next = _is_glm5_next_model(model_config)
 
     if cache_config.cache_dtype == "auto":
         kv_cache_dtype = model_config.dtype
     else:
         kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
-    kernel_block_size = 128
+    kernel_block_size = GLM5_KERNEL_BLOCK_SIZE
     model_cls, _ = ModelRegistry.resolve_model_cls(
         model_config.architecture,
         model_config=model_config,
@@ -98,6 +98,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     for shape, dtype in zip(mamba_shapes, mamba_dtypes):
         mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
     ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+    mamba_raw_size = sum(mamba_sizes)
 
     # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
     # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
@@ -121,14 +122,27 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
-    attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
-    if attn_single_token_k_page_size * attn_block_size != ssm_block_page_size:
-        if model_config.hf_config.model_type == "glm5_next":
-            if ssm_block_page_size % attn_single_token_k_page_size == 0:
-                attn_block_size = ssm_block_page_size // attn_single_token_k_page_size
-            else:
-                attn_block_size = cache_config.block_size or 128
-        else:
+    if is_glm5_next:
+        # Main MLA is the history cache and therefore the hot read path. Make
+        # its payload define the large physical page, then pad the one-state
+        # KDA cache to that page. Keeping the logical block a multiple of the
+        # C128 SFA kernel block lets the worker expose a contiguous sequence of
+        # kernel pages instead of an as_strided MLA view with a hole per block.
+        min_attn_block_size = kernel_block_size * cdiv(
+            mamba_raw_size,
+            kernel_block_size * attn_token_page_size,
+        )
+        requested_block_size = cache_config.block_size or kernel_block_size
+        attn_block_size = kernel_block_size * cdiv(
+            max(requested_block_size, min_attn_block_size),
+            kernel_block_size,
+        )
+    else:
+        attn_block_size = kernel_block_size * cdiv(
+            ssm_block_page_size,
+            kernel_block_size * attn_single_token_k_page_size,
+        )
+        if attn_single_token_k_page_size * attn_block_size != ssm_block_page_size:
             raise AssertionError(
                 "Cannot align ssm_page_size and attn_page_size."
             )
@@ -136,7 +150,14 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it
     # too small.
-    if not is_glm5_next and (
+    if is_glm5_next and cache_config.block_size != attn_block_size:
+        logger.info(
+            "Setting GLM-5 logical attention block size to %d tokens so "
+            "the contiguous MLA page covers the complete KDA state.",
+            attn_block_size,
+        )
+        cache_config.block_size = attn_block_size
+    elif not is_glm5_next and (
         cache_config.block_size is None
         or cache_config.block_size < attn_block_size
     ):
@@ -154,7 +175,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # therefore match, while the smaller indexer/state tensors use a separate
     # page-size class. Other hybrid models retain the established extra conv
     # padding behavior.
-    mamba_raw_size = sum(mamba_sizes)
     target_page_size = _get_mamba_target_page_size(
         is_glm5_next=is_glm5_next,
         attn_page_size=attn_page_size,

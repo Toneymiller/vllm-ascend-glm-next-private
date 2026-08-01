@@ -195,8 +195,8 @@ def _create_glm5_attention_groups(
 
     # Interleave each main/indexer pair while keeping a main spec first. The
     # scheduler unwraps the first nested spec as the representative, so this
-    # makes it a 128-token FullAttentionManager group. Both physical caches
-    # nevertheless receive the same block IDs from that manager.
+    # makes it a full-history FullAttentionManager group. Both physical caches
+    # nevertheless receive the same scheduler block IDs from that manager.
     full_names = [
         name
         for main_name, indexer_name in zip(main_names, indexer_names)
