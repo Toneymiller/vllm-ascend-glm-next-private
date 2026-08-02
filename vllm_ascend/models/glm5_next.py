@@ -103,9 +103,11 @@ INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
 
-# 完整 Glm5NextForConditionalGeneration checkpoint 同时包含视觉塔和语言
-# 模型。Ascend 当前为该 architecture 注册纯文本运行 wrapper：保留并跳过
-# 视觉权重，将 HF 多模态 wrapper 下的语言模型前缀映射到纯文本模型。
+# 该 mapper 用于 AscendGlm5NextForCausalLM 加载多模态 checkpoint 时，
+# 跳过视觉塔权重，仅加载语言模型部分。
+# 注意：当使用 Glm5NextForConditionalGeneration architecture 时，
+# 应使用 AscendGlm5NextForConditionalGeneration（多模态 wrapper），
+# 此 mapper 仅在需要纯文本推理时使用。
 GLM5_CONDITIONAL_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_prefix={
         "model.visual.": None,

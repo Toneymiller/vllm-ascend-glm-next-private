@@ -17,7 +17,12 @@
 
 
 import torch
-from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.conv import Conv2dLayer, Conv3dLayer
+
+
+class AscendConv2dLayer(Conv2dLayer):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_conv(x)
 
 
 class AscendConv3dLayer(Conv3dLayer):

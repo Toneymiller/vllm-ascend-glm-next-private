@@ -11,12 +11,11 @@ def register_model():
     ModelRegistry.register_model(
         "Glm5NextForCausalLM", "vllm_ascend.models.glm5_next:AscendGlm5NextForCausalLM"
     )
-    # 当前 Ascend 适配仅包含 GLM-5 Next 的语言模型。原始多模态权重
-    # 使用 ConditionalGeneration architecture；将它显式映射到文本实现，
-    # 保留权重 config.json 不变，同时避免 vLLM 尝试加载尚未适配的视觉处理器。
+    # Glm5NextForConditionalGeneration -> AscendGlm5NextForConditionalGeneration (多模态)
+    # Glm5NextForCausalLM -> AscendGlm5NextForCausalLM (纯文本)
     ModelRegistry.register_model(
         "Glm5NextForConditionalGeneration",
-        "vllm_ascend.models.glm5_next:AscendGlm5NextForCausalLM",
+        "vllm_ascend.models.glm5_next_multimodal:AscendGlm5NextForConditionalGeneration",
     )
     ModelRegistry.register_model(
         "Glm5NextMTPModel",
