@@ -100,7 +100,7 @@ from vllm_ascend.transformers_utils.configs.glm5_next import Glm5NextTextConfig
 
 INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
-INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
+INDEXER_KPOOL_KEY_CHUNK_SIZE = 1920
 
 # 完整 Glm5NextForConditionalGeneration checkpoint 同时包含视觉塔和语言
 # 模型。Ascend 当前为该 architecture 注册纯文本运行 wrapper：保留并跳过
