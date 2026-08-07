@@ -14,7 +14,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import direct_register_custom_op
 
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
-INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
+INDEXER_KPOOL_KEY_CHUNK_SIZE = 1920
 TRITON_MAX_POOL_SEQ_LEN = 2048
 TRITON_MAX_POOL_TOPK = 128
 TRITON_HEAD_DIM = 128
