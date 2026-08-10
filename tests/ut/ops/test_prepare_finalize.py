@@ -88,10 +88,12 @@ class TestPrepareAndFinalize(unittest.TestCase):
             hidden_states, router_logits, enable_shared_expert_dp=False, replace_allreduce=False
         )
         h_out = prepare_output.hidden_states
+        mask = prepare_output.mc2_mask
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
 
         # With TP=2, should split into 2 parts
         self.assertEqual(h_out.shape[0], 2)
+        self.assertEqual(mask.tolist(), [1, 0])
         self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
 
         # Mock all_gather behavior
@@ -108,6 +110,64 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         # Should concat back to original size
         self.assertEqual(final_result.shape[0], 4)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=2)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_mc2_shared_expert_keeps_mask_for_unsplit_hidden_rows(
+        self,
+        mock_get_forward_context,
+        mock_tp_rank,
+        mock_tp_size,
+    ):
+        mock_context = MagicMock()
+        mock_context.mc2_mask = torch.tensor([1, 0, 1, 0])
+        mock_context.padded_num_tokens = 4
+        mock_get_forward_context.return_value = mock_context
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        hidden_states = torch.randn(4, 8)
+        router_logits = torch.randn(4, 2)
+
+        prepare_output = layer.prepare(
+            hidden_states,
+            router_logits,
+            enable_shared_expert_dp=True,
+            replace_allreduce=False,
+        )
+
+        self.assertEqual(prepare_output.hidden_states.shape[0], 4)
+        self.assertEqual(prepare_output.router_logits.shape[0], 4)
+        self.assertEqual(prepare_output.mc2_mask.tolist(), [1, 0, 1, 0])
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=8)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_mc2_mtp_trims_padded_mask_to_actual_hidden_rows(
+        self,
+        mock_get_forward_context,
+        mock_tp_rank,
+        mock_tp_size,
+    ):
+        mock_context = MagicMock()
+        mock_context.mc2_mask = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0])
+        mock_context.padded_num_tokens = 8
+        mock_get_forward_context.return_value = mock_context
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        hidden_states = torch.randn(4, 8)
+        router_logits = torch.randn(4, 2)
+
+        prepare_output = layer.prepare(
+            hidden_states,
+            router_logits,
+            enable_shared_expert_dp=False,
+            replace_allreduce=True,
+        )
+
+        self.assertEqual(prepare_output.hidden_states.shape[0], 4)
+        self.assertEqual(prepare_output.router_logits.shape[0], 4)
+        self.assertEqual(prepare_output.mc2_mask.tolist(), [1, 1, 1, 1])
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)

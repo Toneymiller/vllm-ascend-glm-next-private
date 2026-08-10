@@ -1321,6 +1321,87 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
 @patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
+@patch(
+    "torch.ops.vllm.glm5_next_kpool_compress_and_write_cache",
+    create=True,
+)
+def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
+    mock_compress,
+    mock_lightning_indexer,
+    mock_get_forward_context,
+):
+    expected = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
+    mock_lightning_indexer.return_value = expected
+
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
+    indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
+    state_layer = SimpleNamespace(
+        prefix="layer.indexer.state",
+        compress_ratio=4,
+        kv_cache=state_cache,
+    )
+    indexer_layer = SimpleNamespace(
+        prefix="layer.indexer.k_cache",
+        kv_cache=indexer_cache,
+    )
+    state_metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([3, -1, -1, -1, -1, -1, -1]),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        block_size=4,
+    )
+    indexer_metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([0, -1, -1, -1, -1, -1, -1]),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+    )
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        cum_query_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+    )
+    mock_get_forward_context.return_value = SimpleNamespace(
+        virtual_engine=0,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        attn_metadata={
+            state_layer.prefix: state_metadata,
+            indexer_layer.prefix: indexer_metadata,
+            "layer.attn": attn_metadata,
+        },
+    )
+    op = AscendSparseAttnIndexerKpool(
+        k_cache=indexer_layer,
+        quant_block_size=128,
+        scale_fmt=None,
+        topk_tokens=4,
+        head_dim=2,
+        max_model_len=16,
+        max_total_seq_len=16,
+        topk_indices_buffer=None,
+        state_cache=state_layer,
+        attn_layer_name="layer.attn",
+    )
+
+    result = op.forward_ascend(
+        torch.empty((7, 1)),
+        torch.zeros((7, 1, 2), dtype=torch.bfloat16),
+        torch.arange(14, dtype=torch.bfloat16).view(7, 2),
+        torch.ones((7, 1), dtype=torch.bfloat16),
+        gate_score=torch.zeros((7, 2), dtype=torch.bfloat16),
+        compress_ape=torch.zeros((4, 2), dtype=torch.float32),
+        index_kpool=4,
+        positions=torch.arange(7, dtype=torch.int64),
+    )
+
+    torch.testing.assert_close(result, expected)
+    assert mock_compress.call_args.args[1].shape[0] == 1
+    assert mock_compress.call_args.args[4].shape[0] == 1
+    assert mock_lightning_indexer.call_args.args[0].shape[0] == 1
+    assert mock_lightning_indexer.call_args.args[6].shape[0] == 1
+
+
+@patch("vllm_ascend.models.glm5_next.get_forward_context")
+@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_scatter,

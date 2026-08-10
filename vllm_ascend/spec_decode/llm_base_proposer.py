@@ -408,7 +408,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_layer_names = self._draft_attn_layer_names & set(kv_cache_group.layer_names)
             for layer_name in sorted(draft_layer_names):
                 draft_layer_to_gid[layer_name] = gid
-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
+                attn_layer = all_attn_layers[layer_name]
+                attn_backend = attn_layer.get_attn_backend()
                 group_key = (attn_backend.full_cls_name(), gid)
                 if group_key in attention_groups:
                     attention_groups[group_key].layer_names.append(layer_name)
@@ -422,6 +423,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
                     else None
                 )
+                # The compressed indexer shares the main MLA block table. Its
+                # builder needs the manager block size to collapse the table's
+                # kernel-sized sub-blocks back into scheduler blocks.
+                if getattr(attn_layer, "cache_role", "kv") == "indexer":
+                    kernel_block_size = None
                 attn_group = AttentionGroup(
                     backend=attn_backend,
                     layer_names=[layer_name],

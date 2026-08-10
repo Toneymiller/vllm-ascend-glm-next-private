@@ -29,16 +29,8 @@ from vllm_ascend.models.glm5_next import (
     AscendGlm5NextDecoderLayer,
     AscendGlm5NextMoE,
     _pad_nope_kv_a_weight,
+    get_spec_layer_idx_from_weight_name,
 )
-
-
-def _get_spec_layer_idx(config, weight_name: str) -> int | None:
-    num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
-    first_mtp_layer = config.num_hidden_layers
-    for layer_idx in range(first_mtp_layer, first_mtp_layer + num_mtp_layers):
-        if weight_name.startswith(f"model.layers.{layer_idx}.") or weight_name.startswith(f"layers.{layer_idx}."):
-            return layer_idx
-    return None
 
 
 class AscendGlm5NextMultiTokenPredictorLayer(nn.Module):
@@ -273,7 +265,7 @@ class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
-            spec_layer = _get_spec_layer_idx(self.config, name)
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
@@ -289,8 +281,6 @@ class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 if "mlp.experts." in name and name not in params_dict:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                if mapped_name not in params_dict:
-                    continue
                 param = params_dict[mapped_name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(mapped_name)
@@ -305,8 +295,6 @@ class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     if weight_name not in name:
                         continue
                     mapped_name = name.replace(weight_name, param_name)
-                    if mapped_name not in params_dict:
-                        continue
                     param = params_dict[mapped_name]
                     param.weight_loader(
                         param,
@@ -333,7 +321,15 @@ class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(mapped_name)
 
         loaded_layers = {
-            layer_idx for name in loaded_params if (layer_idx := _get_spec_layer_idx(self.config, name)) is not None
+            layer_idx
+            for name in loaded_params
+            if (
+                layer_idx := get_spec_layer_idx_from_weight_name(
+                    self.config,
+                    name,
+                )
+            )
+            is not None
         }
         expected_layers = set(
             range(

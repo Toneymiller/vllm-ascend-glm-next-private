@@ -129,6 +129,25 @@ GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+def get_spec_layer_idx_from_weight_name(config, weight_name: str) -> int | None:
+    num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
+    if num_mtp_layers <= 0:
+        return None
+    first_mtp_layer = config.num_hidden_layers
+    for layer_idx in range(first_mtp_layer, first_mtp_layer + num_mtp_layers):
+        if f"layers.{layer_idx}." in weight_name:
+            return layer_idx
+    return None
+
+
+def _expand_mhc_residual_streams(
+    hidden_states: torch.Tensor,
+    num_streams: int,
+) -> torch.Tensor:
+    streams = hidden_states.unsqueeze(1).expand(-1, num_streams, -1)
+    return streams.contiguous().view(hidden_states.shape[0], -1)
+
+
 class AscendGlm5NextGatedRMSNormParams(nn.Module):
     """保存 gated RMSNorm 参数，并匹配 Transformers checkpoint 命名。"""
 
@@ -1179,12 +1198,20 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         if not isinstance(indexer_cache, torch.Tensor) or indexer_cache.dtype != torch.bfloat16:
             raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
 
-        num_tokens = positions.shape[0]
+        is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        # Eager MTP keeps the first-pass buffer length for later draft steps,
+        # while the per-step attention metadata contains only the real query
+        # rows. Do not feed those padded rows into cache/indexer addressing.
+        # Full graphs must retain their captured fixed shape instead.
+        num_tokens = (
+            positions.shape[0]
+            if is_full_graph
+            else min(attn_metadata.num_actual_tokens, positions.shape[0])
+        )
         k = k[:num_tokens].reshape(-1, self.head_dim)
         gate_score = gate_score[:num_tokens].reshape(-1, self.head_dim)
         current_state = torch.cat([k, gate_score], dim=-1).to(state_cache.dtype)
         state_slots = state_metadata.slot_mapping[:num_tokens]
-        is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
         self._scatter_paged_cache(
             state_cache,
             state_slots,
@@ -1257,7 +1284,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             attn_metadata.cum_query_lens,
             indexer_metadata.seq_lens,
             indexer_metadata.block_table,
-            positions,
+            positions[:num_tokens],
             index_topk=self.topk_tokens,
             index_kpool=index_kpool,
             max_pool_seq_len=max_pool_seq_len,
@@ -2207,7 +2234,7 @@ class AscendGlm5NextDecoderLayer(nn.Module):
         x = hidden_states
         if self.layer_idx == 0:
             n = self.hc_mult
-            x = x.unsqueeze(-1).expand(-1, -1, n).reshape(x.shape[0], n * self.hidden_size)
+            x = _expand_mhc_residual_streams(x, n)
 
         layer_input, residual_mhc, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(layer_input)
@@ -2335,11 +2362,13 @@ class AscendGlm5NextModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
-            if "conv1d.weight" in name:
+            if name.endswith(".conv1d.weight"):
                 if loaded_weight.dim() == 3:
                     loaded_weight = loaded_weight.squeeze(1)
                 q_w, k_w, v_w = loaded_weight.chunk(3, dim=0)
@@ -2397,13 +2426,19 @@ class AscendGlm5NextModel(nn.Module):
             for param_name, weight_name, expert_id, expert_shard_id in expert_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                if is_pp_missing_parameter(name, self):
+                mapped_name = name.replace(weight_name, param_name)
+                if is_pp_missing_parameter(mapped_name, self):
                     continue
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, name, expert_id=expert_id, shard_id=expert_shard_id)
-                loaded_params.add(name)
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    mapped_name,
+                    expert_id=expert_id,
+                    shard_id=expert_shard_id,
+                )
+                loaded_params.add(mapped_name)
                 handled = True
                 break
             if handled:

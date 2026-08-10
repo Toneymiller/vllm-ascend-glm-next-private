@@ -18,6 +18,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.indexer_kpool_mla_v1 import AscendIndexerKPoolMLABackend
 
 
@@ -196,7 +197,12 @@ class AscendIndexerKPoolMLAAttention(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        torch.ops.vllm.indexer_kpool_mla_forward(hidden_states, output, self.prefix)
+        torch.ops.vllm.indexer_kpool_mla_forward(
+            hidden_states,
+            _EXTRA_CTX.flash_comm_v1_enabled,
+            output,
+            self.prefix,
+        )
         return output
 
 
@@ -246,6 +252,7 @@ def _collect_cache_metadata(wrapper: nn.Module, metadata: dict[str, object]) -> 
 
 def indexer_kpool_mla_forward(
     hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -258,6 +265,7 @@ def indexer_kpool_mla_forward(
             hidden_states,
             tuple(torch.tensor([]) for _ in wrapper.cache_layers),
             None,
+            need_gather_q_kv,
             output=output,
         )
         return
@@ -275,12 +283,14 @@ def indexer_kpool_mla_forward(
         hidden_states,
         caches,
         layer_metadata,
+        need_gather_q_kv,
         output=output,
     )
 
 
 def indexer_kpool_mla_forward_fake(
     hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:

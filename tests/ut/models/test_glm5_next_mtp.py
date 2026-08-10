@@ -11,12 +11,12 @@ import vllm.config.speculative as speculative_config
 from vllm_ascend.models.glm5_next import (
     AscendGlm5NextForCausalLM,
     _pad_nope_kv_a_weight,
+    get_spec_layer_idx_from_weight_name,
 )
 from vllm_ascend.models.glm5_next_mtp import (
     AscendGlm5NextMTP,
     AscendGlm5NextMultiTokenPredictor,
     AscendGlm5NextMultiTokenPredictorLayer,
-    _get_spec_layer_idx,
 )
 from vllm_ascend.patch.platform.patch_speculative_config import (
     hf_config_override,
@@ -30,9 +30,9 @@ def test_get_spec_layer_idx_accepts_checkpoint_prefixes():
         num_nextn_predict_layers=2,
     )
 
-    assert _get_spec_layer_idx(config, "model.layers.45.enorm.weight") == 45
-    assert _get_spec_layer_idx(config, "layers.46.self_attn.q_a_proj.weight") == 46
-    assert _get_spec_layer_idx(config, "model.layers.44.mlp.weight") is None
+    assert get_spec_layer_idx_from_weight_name(config, "model.layers.45.enorm.weight") == 45
+    assert get_spec_layer_idx_from_weight_name(config, "layers.46.self_attn.q_a_proj.weight") == 46
+    assert get_spec_layer_idx_from_weight_name(config, "model.layers.44.mlp.weight") is None
 
 
 def test_mtp_rewrites_layer_and_shared_weight_names():
