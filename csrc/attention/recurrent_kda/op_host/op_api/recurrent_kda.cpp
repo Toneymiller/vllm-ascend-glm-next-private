@@ -44,12 +44,14 @@ const std::array<const aclTensor *, 2> RecurrentKda(
     bool safeGate,
     double lowerBound,
     bool stateVFirst,
+    int64_t stateBlockStride,
     const aclTensor *out,
     aclOpExecutor *executor)
 {
     L0_DFX(RecurrentKda, query, key, value, gate, beta, stateRef, cuSeqlens, ssmStateIndicesOptional,
            aLogOptional, dtBiasOptional, numAcceptedTokensOptional, layout, scale, useQkL2normInKernel,
-           useGateInKernel, useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBound, stateVFirst, out,
+           useGateInKernel, useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBound, stateVFirst,
+           stateBlockStride, out,
            stateRef);
 
     float scaleAttr = static_cast<float>(scale);
@@ -60,7 +62,7 @@ const std::array<const aclTensor *, 2> RecurrentKda(
                  dtBiasOptional, numAcceptedTokensOptional),
         OP_OUTPUT(out, stateRef),
         OP_ATTR(layout, scaleAttr, useQkL2normInKernel, useGateInKernel, useBetaSigmoidInKernel, allowNegEigval,
-                safeGate, lowerBoundAttr, stateVFirst));
+                safeGate, lowerBoundAttr, stateVFirst, stateBlockStride));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "RecurrentKda ADD_TO_LAUNCHER_LIST_AICORE failed.");
         return {nullptr, nullptr};

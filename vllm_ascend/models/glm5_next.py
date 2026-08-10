@@ -1097,15 +1097,16 @@ class AscendSparseAttnIndexerKpool(nn.Module):
 
         if write_cache:
             write_locs = loc
-            write_k = compressed_k
             if write_mask is not None:
-                selected = write_mask.nonzero().flatten()
-                write_locs = write_locs[selected]
-                write_k = write_k[selected]
+                write_locs = torch.where(
+                    write_mask,
+                    write_locs,
+                    torch.full_like(write_locs, -1),
+                )
             AscendSparseAttnIndexerKpool._scatter_paged_cache(
                 indexer_k_cache,
                 write_locs,
-                write_k.view(-1, head_dim),
+                compressed_k.view(-1, head_dim),
                 indexer_k_cache.shape[1],
             )
 
@@ -1219,58 +1220,59 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             state_metadata.block_size,
         )
 
-        selected = (
-            torch.arange(num_tokens, device=k.device)
-            if is_full_graph
-            else (indexer_metadata.slot_mapping[:num_tokens] >= 0).nonzero().flatten()
+        token_ids = torch.arange(num_tokens, device=k.device)
+        request_ids = torch.bucketize(
+            token_ids,
+            attn_metadata.cum_query_lens,
+            right=True,
+        ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
+        pool_state = self._gather_compressor_state(
+            state_cache,
+            state_metadata,
+            positions[:num_tokens],
+            request_ids,
+            index_kpool,
         )
-        if is_full_graph or selected.numel() > 0:
-            token_ids = torch.arange(num_tokens, device=k.device)
-            request_ids = torch.bucketize(
-                token_ids,
-                attn_metadata.cum_query_lens,
-                right=True,
-            ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
-            pool_state = self._gather_compressor_state(
-                state_cache,
-                state_metadata,
-                positions[selected],
-                request_ids[selected],
-                index_kpool,
-            )
-            query_ends = attn_metadata.cum_query_lens
-            query_offsets = torch.cat([torch.zeros_like(query_ends[:1]), query_ends[:-1]])
-            query_lens = query_ends - query_offsets
-            selected_request_ids = request_ids[selected]
-            request_query_starts = attn_metadata.seq_lens[selected_request_ids] - query_lens[selected_request_ids]
-            pool_offsets = torch.arange(
-                index_kpool - 1,
-                -1,
-                -1,
-                device=k.device,
-            )
-            pool_positions = positions[selected, None] - pool_offsets[None, :]
-            local_positions = pool_positions - request_query_starts[:, None]
-            current_mask = (local_positions >= 0) & (local_positions < query_lens[selected_request_ids, None])
-            current_indices = (
-                (query_offsets[selected_request_ids, None] + local_positions.clamp_min(0))
-                .long()
-                .clamp_max(num_tokens - 1)
-            )
-            current_pool_state = current_state[current_indices]
-            pool_state = torch.where(
-                current_mask.unsqueeze(-1),
-                current_pool_state,
-                pool_state,
-            )
-            pool_k, pool_gate = pool_state.split(self.head_dim, dim=-1)
-            torch.ops.vllm.glm5_next_kpool_compress_and_write_cache(
-                indexer_cache,
-                pool_k.to(torch.bfloat16),
-                pool_gate.to(torch.bfloat16),
-                compress_ape,
-                indexer_metadata.slot_mapping[selected].to(torch.int64),
-            )
+        query_ends = attn_metadata.cum_query_lens
+        query_offsets = torch.cat([torch.zeros_like(query_ends[:1]), query_ends[:-1]])
+        query_lens = query_ends - query_offsets
+        request_query_starts = attn_metadata.seq_lens[request_ids] - query_lens[request_ids]
+        pool_offsets = torch.arange(
+            index_kpool - 1,
+            -1,
+            -1,
+            device=k.device,
+        )
+        pool_positions = positions[:num_tokens, None] - pool_offsets[None, :]
+        local_positions = pool_positions - request_query_starts[:, None]
+        current_mask = (local_positions >= 0) & (local_positions < query_lens[request_ids, None])
+        current_indices = (
+            (query_offsets[request_ids, None] + local_positions.clamp_min(0))
+            .long()
+            .clamp_max(num_tokens - 1)
+        )
+        current_pool_state = current_state[current_indices]
+        pool_state = torch.where(
+            current_mask.unsqueeze(-1),
+            current_pool_state,
+            pool_state,
+        )
+        pool_k, pool_gate = pool_state.split(self.head_dim, dim=-1)
+        raw_write_locs = indexer_metadata.slot_mapping[:num_tokens].to(torch.int64)
+        write_mask = raw_write_locs >= 0
+        write_locs = torch.where(
+            write_mask,
+            raw_write_locs,
+            torch.zeros_like(raw_write_locs),
+        )
+        torch.ops.vllm.glm5_next_kpool_compress_and_write_cache(
+            indexer_cache,
+            pool_k.to(torch.bfloat16),
+            pool_gate.to(torch.bfloat16),
+            compress_ape,
+            write_locs,
+            write_mask,
+        )
 
         max_pool_seq_len = (
             indexer_metadata.block_table.shape[1] * indexer_cache.shape[1]

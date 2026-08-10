@@ -61,6 +61,7 @@ struct RecurrentKdaParams {
     bool safeGate = false;
     double lowerBound = -5.0;
     bool stateVFirst = true;
+    int64_t stateBlockStride = 0;
     const aclTensor *out = nullptr;
 };
 
@@ -392,6 +393,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     bool safeGate,
     double lowerBound,
     bool stateVFirst,
+    int64_t stateBlockStride,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
@@ -400,7 +402,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
                    DFX_IN(query, key, value, gate, beta, stateRef, cuSeqlens, ssmStateIndicesOptional,
                           aLogOptional, dtBiasOptional, numAcceptedTokensOptional, layout, scale, outputFinalState,
                           useQkL2normInKernel, useGateInKernel, useBetaSigmoidInKernel, allowNegEigval, safeGate,
-                          lowerBound, stateVFirst),
+                          lowerBound, stateVFirst, stateBlockStride),
                    DFX_OUT(out, stateRef));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
@@ -410,7 +412,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     RecurrentKdaParams params{query, key, value, gate, beta, stateRef, cuSeqlens, ssmStateIndicesOptional,
                               aLogOptional, dtBiasOptional, numAcceptedTokensOptional, layout, scale,
                               outputFinalState, useQkL2normInKernel, useGateInKernel, useBetaSigmoidInKernel,
-                              allowNegEigval, safeGate, lowerBound, stateVFirst, out};
+                              allowNegEigval, safeGate, lowerBound, stateVFirst, stateBlockStride, out};
 
     CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckDtypeValid(params), ACLNN_ERR_PARAM_INVALID);
@@ -419,24 +421,14 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     CHECK_RET(CheckShape(params, parsedLayout), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(PreProcess(params, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
-    aclTensor *stateForKernel = params.stateRef;
-    bool stateNeedViewCopy = !IsContiguous(params.stateRef);
-    if (stateNeedViewCopy) {
-        const aclTensor *contiguousState = params.stateRef;
-        CHECK_RET(DataContiguous(contiguousState, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_INNER_NULLPTR);
-        stateForKernel = const_cast<aclTensor *>(contiguousState);
-    }
-
     auto result = l0op::RecurrentKda(params.query, params.key, params.value, params.gate, params.beta,
-                                     stateForKernel, params.cuSeqlens, params.ssmStateIndicesOptional,
+                                     params.stateRef, params.cuSeqlens, params.ssmStateIndicesOptional,
                                      params.aLogOptional, params.dtBiasOptional, params.numAcceptedTokensOptional,
                                      params.layout, params.scale, params.useQkL2normInKernel,
                                      params.useGateInKernel, params.useBetaSigmoidInKernel, params.allowNegEigval,
-                                     params.safeGate, params.lowerBound, params.stateVFirst, params.out, executorPtr);
+                                     params.safeGate, params.lowerBound, params.stateVFirst,
+                                     params.stateBlockStride, params.out, executorPtr);
     CHECK_RET(result[0] != nullptr && result[1] != nullptr, ACLNN_ERR_INNER_NULLPTR);
-    if (stateNeedViewCopy) {
-        CHECK_RET(l0op::ViewCopy(result[1], params.stateRef, executorPtr) != nullptr, ACLNN_ERR_INNER_NULLPTR);
-    }
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);

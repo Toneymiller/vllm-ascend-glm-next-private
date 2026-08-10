@@ -33,6 +33,7 @@ const std::array<const aclTensor *, 2> RecurrentKda(
     bool safeGate,
     double lowerBound,
     bool stateVFirst,
+    int64_t stateBlockStride,
     const aclTensor *out,
     aclOpExecutor *executor);
 }

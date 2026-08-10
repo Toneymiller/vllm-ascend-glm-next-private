@@ -25,6 +25,7 @@ def _validate_inputs(
     slot_score: torch.Tensor,
     ape: torch.Tensor,
     loc: torch.Tensor,
+    write_mask: torch.Tensor | None,
 ) -> None:
     if slot_k.ndim != 3:
         raise ValueError(f"slot_k must be [N,P,D], got {slot_k.shape}.")
@@ -48,6 +49,8 @@ def _validate_inputs(
         raise ValueError(f"kv_cache must be [blocks,block,1,{slot_k.shape[2]}], got {kv_cache.shape}.")
     if kv_cache.dtype != torch.bfloat16:
         raise TypeError(f"kv_cache must be bfloat16, got {kv_cache.dtype}.")
+    if write_mask is not None and write_mask.shape != (slot_k.shape[0],):
+        raise ValueError(f"write_mask must have shape {(slot_k.shape[0],)}, got {write_mask.shape}.")
     for name, tensor in (
         ("kv_cache", kv_cache),
         ("slot_score", slot_score),
@@ -56,6 +59,8 @@ def _validate_inputs(
     ):
         if tensor.device != slot_k.device:
             raise ValueError(f"{name} must be on {slot_k.device}, got {tensor.device}.")
+    if write_mask is not None and write_mask.device != slot_k.device:
+        raise ValueError(f"write_mask must be on {slot_k.device}, got {write_mask.device}.")
 
 
 def _can_use_triton(slot_k: torch.Tensor) -> bool:
@@ -76,6 +81,7 @@ def _fallback_kpool_compress_and_write_cache(
     slot_score: torch.Tensor,
     ape: torch.Tensor,
     loc: torch.Tensor,
+    write_mask: torch.Tensor,
 ) -> None:
     if slot_k.shape[0] == 0:
         return
@@ -83,9 +89,24 @@ def _fallback_kpool_compress_and_write_cache(
     scores = slot_score.float() + ape.float().unsqueeze(0)
     compressed_k = (torch.softmax(scores, dim=1) * slot_k.float()).sum(dim=1).to(torch.bfloat16)
     cache_block_size = kv_cache.shape[1]
-    block_ids = torch.div(loc, cache_block_size, rounding_mode="floor")
-    block_offsets = torch.remainder(loc, cache_block_size)
-    kv_cache[block_ids, block_offsets, 0, :] = compressed_k
+    safe_locs = torch.where(write_mask, loc, torch.zeros_like(loc))
+    block_ids = torch.div(safe_locs, cache_block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(safe_locs, cache_block_size)
+    row_zero = kv_cache[0, 0, 0, :].clone()
+    row_zero_mask = write_mask & (safe_locs == 0)
+    update_zero = torch.where(
+        row_zero_mask.unsqueeze(-1),
+        compressed_k,
+        torch.zeros_like(compressed_k),
+    ).sum(dim=0)
+    expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
+    safe_values = torch.where(
+        write_mask.unsqueeze(-1),
+        compressed_k,
+        row_zero.unsqueeze(0),
+    )
+    kv_cache[block_ids, block_offsets, 0, :] = safe_values
+    kv_cache[0, 0, 0, :].copy_(expected_zero)
 
 
 def glm5_next_kpool_compress_and_write_cache(
@@ -94,9 +115,14 @@ def glm5_next_kpool_compress_and_write_cache(
     slot_score: torch.Tensor,
     ape: torch.Tensor,
     loc: torch.Tensor,
+    write_mask: torch.Tensor | None = None,
 ) -> None:
     """Compress ``slot_k`` with softmax(slot_score + ape) and write paged cache."""
-    _validate_inputs(kv_cache, slot_k, slot_score, ape, loc)
+    _validate_inputs(kv_cache, slot_k, slot_score, ape, loc, write_mask)
+    valid_write = (loc >= 0) & (loc < kv_cache.shape[0] * kv_cache.shape[1])
+    if write_mask is not None:
+        valid_write = valid_write & write_mask
+    safe_locs = torch.where(valid_write, loc, torch.zeros_like(loc))
     if _can_use_triton(slot_k):
         assert glm5_next_kpool_compress_and_write_cache_triton is not None
         glm5_next_kpool_compress_and_write_cache_triton(
@@ -104,7 +130,8 @@ def glm5_next_kpool_compress_and_write_cache(
             slot_k,
             slot_score,
             ape,
-            loc,
+            safe_locs,
+            write_mask=valid_write,
         )
         return
 
@@ -113,7 +140,8 @@ def glm5_next_kpool_compress_and_write_cache(
         slot_k,
         slot_score,
         ape,
-        loc,
+        safe_locs,
+        valid_write,
     )
 
 
@@ -123,6 +151,7 @@ def glm5_next_kpool_compress_and_write_cache_fake(
     slot_score: torch.Tensor,
     ape: torch.Tensor,
     loc: torch.Tensor,
+    write_mask: torch.Tensor | None = None,
 ) -> None:
     return
 

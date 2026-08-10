@@ -72,6 +72,7 @@ struct RecurrentKdaTilingContext {
     uint32_t allowNegEigval = 0;
     uint32_t safeGate = 0;
     uint32_t stateVFirst = 1;
+    uint64_t stateBlockStride = 0;
     ge::DataType stateDtype = ge::DT_BF16;
     uint64_t aivNum = 0;
     uint64_t ubSize = 0;
@@ -358,6 +359,8 @@ private:
             tiling.b = static_cast<uint32_t>(cuSeqlensShape.GetDim(RKDA_DIM_0) - 1);
         }
         tiling.sBlockNum = static_cast<uint32_t>(stateShape.GetDim(RKDA_DIM_0));
+        const uint64_t logicalStateBlockSize = static_cast<uint64_t>(tiling.nv) * tiling.dv * tiling.dk;
+        tiling.stateBlockStride = ctx_.stateBlockStride == 0 ? logicalStateBlockSize : ctx_.stateBlockStride;
         tiling.ssmStateStride = (ctx_.hasSsmStateIndices && ctx_.ssmStateShape.GetDimNum() == RKDA_METADATA_RANK2) ?
                                 static_cast<uint32_t>(ctx_.ssmStateShape.GetDim(RKDA_DIM_1)) : 0;
         tiling.scale = ctx_.scale;
@@ -377,6 +380,12 @@ private:
 
     ge::graphStatus CheckShapeValueRangeAndRule(const RecurrentKdaTilingData &tiling) const
     {
+        const uint64_t logicalStateBlockSize = static_cast<uint64_t>(tiling.nv) * tiling.dv * tiling.dk;
+        OP_CHECK_IF(tiling.stateBlockStride < logicalStateBlockSize,
+                    OP_LOGE(ctx_.nodeName,
+                            "state_block_stride must be at least HV*V*K=%lu, but got %lu.",
+                            logicalStateBlockSize, tiling.stateBlockStride),
+                    return ge::GRAPH_FAILED);
         OP_CHECK_IF(tiling.nk > 256 || tiling.nv > 256,
                     OP_LOGE(ctx_.nodeName,
                             "H/HV must be <= 256, but H=%u, HV=%u.", tiling.nk, tiling.nv),

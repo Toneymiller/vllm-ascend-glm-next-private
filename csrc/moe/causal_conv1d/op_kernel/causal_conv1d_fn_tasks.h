@@ -107,7 +107,8 @@
      LocalTensor<T> ring = inBuf.Get<T>();
      bool hasGmHistoryCopy = false;
      bool hasVectorInit = false;
-     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+     const int64_t stateBaseOffset =
+         static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + channelStart;
      int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * dim + channelStart;
  
      for (int32_t i = 0; i < ringStart; ++i) {
@@ -210,7 +211,8 @@
              continue;
          }
  
-         const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * tilingData_->stateLen * dim + channelStart;
+         const int64_t stateBaseOffset =
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + channelStart;
          const int64_t snapshotBaseOffset = static_cast<int64_t>(seq) * historyCount * dim + channelStart;
          for (int32_t statePos = 0; statePos < historyCount; ++statePos) {
              const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(statePos) * dim;

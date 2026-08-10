@@ -28,6 +28,7 @@ struct alignas(8) RecurrentKdaTilingData {
     uint32_t nv;
     uint32_t dv;
     uint32_t sBlockNum;
+    uint64_t stateBlockStride;
     uint32_t ssmStateStride;
     uint32_t b;
     uint32_t vStep;

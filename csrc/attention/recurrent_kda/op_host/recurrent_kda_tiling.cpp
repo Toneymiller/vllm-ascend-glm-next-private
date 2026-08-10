@@ -43,6 +43,7 @@ const size_t ATTR_ALLOW_NEG_EIGVAL_INDEX = 5;
 const size_t ATTR_SAFE_GATE_INDEX = 6;
 const size_t ATTR_LOWER_BOUND_INDEX = 7;
 const size_t ATTR_STATE_V_FIRST_INDEX = 8;
+const size_t ATTR_STATE_BLOCK_STRIDE_INDEX = 9;
 
 void RecurrentKdaTiling::InitCompileInfo()
 {
@@ -103,6 +104,7 @@ RecurrentKdaTilingContext RecurrentKdaTiling::BuildProcessorContext() const
     ctx.allowNegEigval = tilingData_.allowNegEigval;
     ctx.safeGate = tilingData_.safeGate;
     ctx.stateVFirst = tilingData_.stateVFirst;
+    ctx.stateBlockStride = tilingData_.stateBlockStride;
     return ctx;
 }
 
@@ -306,6 +308,11 @@ ge::graphStatus RecurrentKdaTiling::GetAttrsInfo()
     tilingData_.safeGate = *attrs->GetAttrPointer<bool>(ATTR_SAFE_GATE_INDEX) ? 1 : 0;
     tilingData_.lowerBound = *attrs->GetAttrPointer<float>(ATTR_LOWER_BOUND_INDEX);
     tilingData_.stateVFirst = *attrs->GetAttrPointer<bool>(ATTR_STATE_V_FIRST_INDEX) ? 1 : 0;
+    const int64_t *stateBlockStride = attrs->GetAttrPointer<int64_t>(ATTR_STATE_BLOCK_STRIDE_INDEX);
+    OP_CHECK_IF(stateBlockStride != nullptr && *stateBlockStride < 0,
+                OP_LOGE(context_->GetNodeName(), "state_block_stride must be non-negative"),
+                return ge::GRAPH_FAILED);
+    tilingData_.stateBlockStride = stateBlockStride == nullptr ? 0 : static_cast<uint64_t>(*stateBlockStride);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -330,6 +337,7 @@ void RecurrentKdaTiling::PrintTilingData()
     OP_LOGD(context_->GetNodeName(), "nv: [%u]", tilingData_.nv);
     OP_LOGD(context_->GetNodeName(), "dv: [%u]", tilingData_.dv);
     OP_LOGD(context_->GetNodeName(), "sBlockNum: [%u]", tilingData_.sBlockNum);
+    OP_LOGD(context_->GetNodeName(), "stateBlockStride: [%lu]", tilingData_.stateBlockStride);
     OP_LOGD(context_->GetNodeName(), "ssmStateStride: [%u]", tilingData_.ssmStateStride);
     OP_LOGD(context_->GetNodeName(), "b: [%u]", tilingData_.b);
     OP_LOGD(context_->GetNodeName(), "vStep: [%u]", tilingData_.vStep);

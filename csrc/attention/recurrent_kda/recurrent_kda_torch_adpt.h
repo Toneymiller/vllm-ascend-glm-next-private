@@ -95,6 +95,12 @@ at::Tensor recurrent_kda(
                 "recurrent_kda: initial_state must be a non-empty [state_capacity,HV,V,K] pool.");
     TORCH_CHECK(initial_state.scalar_type() == at::kFloat || initial_state.scalar_type() == at::kBFloat16,
                 "recurrent_kda: initial_state must be float32 or bfloat16.");
+    const int64_t logical_state_block_size = hv * v_dim * k_dim;
+    TORCH_CHECK(initial_state.stride(3) == 1 && initial_state.stride(2) == k_dim &&
+                    initial_state.stride(1) == v_dim * k_dim &&
+                    initial_state.stride(0) >= logical_state_block_size,
+                "recurrent_kda: initial_state must have contiguous [HV,V,K] rows and a block stride "
+                "of at least HV*V*K.");
     TORCH_CHECK(a_log.scalar_type() == at::kFloat && a_log.dim() == 1 && a_log.numel() == hv,
                 "recurrent_kda: A_log must be float32 [HV].");
     TORCH_CHECK(dt_bias.scalar_type() == at::kFloat &&
@@ -121,6 +127,7 @@ at::Tensor recurrent_kda(
     const char* layout = is_tnd ? "TND" : "BSND";
     bool output_final_state = true;
     bool state_v_first = true;
+    int64_t state_block_stride = initial_state.stride(0);
     EXEC_NPU_CMD(
         aclnnRecurrentKda,
         query,
@@ -144,6 +151,7 @@ at::Tensor recurrent_kda(
         safe_gate,
         lower_bound,
         state_v_first,
+        state_block_stride,
         output);
     return output;
 }

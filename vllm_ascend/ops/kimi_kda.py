@@ -38,73 +38,31 @@ from vllm_ascend.utils import parse_layer_idx, uses_global_inputs_embeds
 _KDA_CHUNK_SIZE = 64
 
 
-def _stage_padded_conv_state(
-    conv_state: torch.Tensor,
-    cache_indices: torch.Tensor,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    tuple[torch.Tensor, torch.Tensor] | None,
-]:
-    """Present a contiguous cache to kernels that ignore block stride."""
-    natural_block_stride = conv_state[0].numel()
-    if conv_state.stride(0) == natural_block_stride:
-        return conv_state, cache_indices, None
-
-    flat_indices = cache_indices.flatten()
-    valid_mask = flat_indices != PAD_SLOT_ID
-    safe_indices = flat_indices.masked_fill(~valid_mask, 0).to(torch.long)
-    staged_state = conv_state.index_select(0, safe_indices).contiguous()
-
-    local_indices = torch.arange(
-        flat_indices.numel(),
-        dtype=cache_indices.dtype,
-        device=cache_indices.device,
-    )
-    local_indices = local_indices.masked_fill(~valid_mask, PAD_SLOT_ID)
-    return (
-        staged_state,
-        local_indices.view_as(cache_indices),
-        (flat_indices, valid_mask),
-    )
+def _gather_state_rows(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    page_base_state: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, int]]:
+    """Gather only the recurrent payload for active cache rows."""
+    del page_base_state
+    indices = state_indices.flatten().to(torch.long)
+    selected_state = state.index_select(0, indices).contiguous()
+    return selected_state, (state, None, indices, 0)
 
 
-def _restore_padded_conv_state(
-    conv_state: torch.Tensor,
-    staged_state: torch.Tensor,
-    restore_metadata: tuple[torch.Tensor, torch.Tensor] | None,
+def _restore_state_rows(
+    updated_state: torch.Tensor,
+    restore_metadata: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, int],
 ) -> None:
-    if restore_metadata is None:
+    state_or_pages, selected_pages, indices, state_offset = restore_metadata
+    if selected_pages is None:
+        state_or_pages.index_copy_(0, indices, updated_state)
         return
 
-    flat_indices, valid_mask = restore_metadata
-    safe_indices = flat_indices.masked_fill(~valid_mask, 0).to(torch.long)
-    mask_shape = (valid_mask.numel(),) + (1,) * (staged_state.ndim - 1)
-
-    # Keep the restore shape static for ACLGraph. Invalid entries all target
-    # cache line 0, so make their source equal to the value that line 0 should
-    # retain. If line 0 is active in this batch, use its updated staged value.
-    valid_zero_mask = valid_mask & (flat_indices == 0)
-    updated_zero_state = torch.where(
-        valid_zero_mask.view(mask_shape),
-        staged_state,
-        torch.zeros_like(staged_state),
-    ).sum(dim=0)
-    zero_state = torch.where(
-        valid_zero_mask.any(),
-        updated_zero_state,
-        conv_state[0],
+    selected_pages.narrow(1, state_offset, updated_state[0].numel()).copy_(
+        updated_state.reshape(updated_state.shape[0], -1)
     )
-    restore_values = torch.where(
-        valid_mask.view(mask_shape),
-        staged_state,
-        zero_state.unsqueeze(0),
-    )
-    conv_state.index_copy_(
-        0,
-        safe_indices,
-        restore_values,
-    )
+    state_or_pages.index_copy_(0, indices, selected_pages)
 
 
 def _load_kimi_k3_a_log(
@@ -305,28 +263,20 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 "Ascend Kimi KDA requires the convolution cache layout [num_cache_lines, state_len, qkv_dim]."
             )
 
-        staged_state, kernel_cache_indices, restore_metadata = (
-            _stage_padded_conv_state(conv_state, metadata.cache_indices)
-        )
         out = torch.empty_like(mixed_qkv)
         torch.ops._C_ascend.npu_causal_conv1d_custom(
             out,
             mixed_qkv,
             conv_weights_t,
-            conv_state=staged_state,
+            conv_state=conv_state,
             bias_opt=None,
             query_start_loc_opt=metadata.query_start_loc,
-            cache_indices_opt=kernel_cache_indices,
+            cache_indices_opt=metadata.cache_indices,
             initial_state_mode_opt=getattr(metadata, "initial_state_mode", None),
             num_accepted_tokens_opt=num_accepted_tokens,
             activation_mode=1,
             pad_slot_id=PAD_SLOT_ID,
             run_mode=run_mode,
-        )
-        _restore_padded_conv_state(
-            conv_state,
-            staged_state,
-            restore_metadata,
         )
         return out
 
@@ -394,6 +344,7 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         v: torch.Tensor,
         raw_gate: torch.Tensor,
         beta: torch.Tensor,
+        page_base_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         state_indices: torch.Tensor,
         has_initial_state: torch.Tensor,
@@ -424,7 +375,11 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
 
         # The recurrent cache uses [H,V,K].  PR141's AscendC prefill operator
         # uses [H,K,V], so transpose only at that operator boundary.
-        initial_state_vk = recurrent_state[state_indices].contiguous()
+        initial_state_vk, restore_metadata = _gather_state_rows(
+            recurrent_state,
+            state_indices,
+            page_base_state,
+        )
         clear_ssm_states(initial_state_vk, has_initial_state)
 
         initial_state_kv = initial_state_vk.transpose(-1, -2).contiguous()
@@ -471,7 +426,8 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
             return_intermediate=False,
         )
-        recurrent_state[state_indices] = result[1].transpose(-1, -2).contiguous().to(recurrent_state.dtype)
+        final_state_vk = result[1].transpose(-1, -2).contiguous().to(recurrent_state.dtype)
+        _restore_state_rows(final_state_vk, restore_metadata)
         return result[0]
 
     def _forward(
@@ -622,6 +578,7 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                     v_non_spec,
                     raw_gate_non_spec,
                     beta_non_spec,
+                    conv_state,
                     recurrent_state,
                     attn_metadata.prefill_state_indices,
                     attn_metadata.prefill_has_initial_state,

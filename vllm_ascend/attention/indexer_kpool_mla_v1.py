@@ -593,55 +593,42 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         values: torch.Tensor,
         block_size: int,
     ) -> None:
-        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            # A GLM-5 logical cache may occupy only the payload prefix of a
-            # larger physical page. Flattening such an as_strided view would
-            # either fail or discard the physical page stride, so address the
-            # page and its token offset independently.
-            values = values.reshape(values.shape[0], *cache.shape[2:])
-            valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
-            safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-            block_ids = torch.div(
-                safe_slots,
-                block_size,
-                rounding_mode="floor",
-            )
-            block_offsets = torch.remainder(safe_slots, block_size)
-            row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
-            row_zero = cache[0, 0].clone()
-            safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
-            row_zero_mask = valid & (slots == 0)
-            update_zero = torch.where(
-                row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
-                values,
-                torch.zeros_like(values),
-            ).sum(dim=0)
-            expected_zero = torch.where(
-                row_zero_mask.any(),
-                update_zero,
-                row_zero,
-            )
-            cache[block_ids, block_offsets] = safe_values
-            cache[0, 0].copy_(expected_zero)
-            return
-        valid_rows = (
-            (slots >= 0) & (slots < cache.shape[0] * block_size)
-        ).nonzero().flatten()
-        if valid_rows.numel() == 0:
-            return
-        valid_slots = slots[valid_rows]
+        # A GLM-5 logical cache may occupy only the payload prefix of a
+        # larger physical page. Address the page and token offset independently
+        # and map invalid fixed-shape rows to a restored sentinel row.
+        # TP/SP padding can leave values longer than the metadata row domain.
+        # Preserve the old indexed-scatter semantics by consuming only rows
+        # addressable by slot_mapping before applying the fixed-shape mask.
+        num_rows = slots.shape[0]
+        values = values[:num_rows].reshape(num_rows, *cache.shape[2:])
+        valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
         block_ids = torch.div(
-            valid_slots,
+            safe_slots,
             block_size,
             rounding_mode="floor",
         )
-        block_offsets = torch.remainder(valid_slots, block_size)
-        indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
-            cache,
-            indices,
-            values.reshape(values.shape[0], *cache.shape[2:])[valid_rows],
+        block_offsets = torch.remainder(safe_slots, block_size)
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        row_zero = cache[0, 0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+        row_zero_mask = valid & (slots == 0)
+        update_zero = torch.where(
+            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+            values,
+            torch.zeros_like(values),
+        ).sum(dim=0)
+        expected_zero = torch.where(
+            row_zero_mask.any(),
+            update_zero,
+            row_zero,
         )
+        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            cache[block_ids, block_offsets] = safe_values
+        else:
+            indices = torch.stack([block_ids, block_offsets], dim=-1)
+            torch_npu.npu_scatter_nd_update_(cache, indices, safe_values)
+        cache[0, 0].copy_(expected_zero)
 
     def indexer_select_pre_process(
         self,

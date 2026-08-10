@@ -60,6 +60,10 @@
      attrInfo.runMode = (runModePtr == nullptr) ? 0 : *runModePtr;
      OP_CHECK_IF(attrInfo.runMode != 0 && attrInfo.runMode != 1, OP_LOGE(context, "runMode only supports 0/1"),
                  return ge::GRAPH_FAILED);
+     const int64_t *statePageStridePtr = attrs->GetAttrPointer<int64_t>(ATTR_STATE_PAGE_STRIDE_INDEX);
+     attrInfo.statePageStride = (statePageStridePtr == nullptr) ? 0 : *statePageStridePtr;
+     OP_CHECK_IF(attrInfo.statePageStride < 0, OP_LOGE(context, "statePageStride must be non-negative"),
+                 return ge::GRAPH_FAILED);
      return ge::GRAPH_SUCCESS;
  }
  
@@ -147,6 +151,13 @@
                  return ge::GRAPH_FAILED);
      OP_CHECK_IF(sDim != dim, OP_LOGE(context, "convStates.shape[2] must equal dim"), return ge::GRAPH_FAILED);
      OP_CHECK_IF(stateLen < (width - 1), OP_LOGE(context, "convStates.shape[1] must be >= width-1"),
+                 return ge::GRAPH_FAILED);
+     const int64_t logicalStateBlockSize = stateLen * dim;
+     const int64_t statePageStride =
+         (attrInfo.statePageStride == 0) ? logicalStateBlockSize : attrInfo.statePageStride;
+     OP_CHECK_IF(statePageStride < logicalStateBlockSize,
+                 OP_LOGE(context, "statePageStride must be at least state_len*dim=%ld, but got %ld",
+                         logicalStateBlockSize, statePageStride),
                  return ge::GRAPH_FAILED);
  
      auto qslShapePtr = context->GetOptionalInputShape(QUERY_START_LOC_INDEX);
@@ -375,6 +386,7 @@
      tiling.inputMode = inputMode;
      tiling.width = width;
      tiling.stateLen = stateLen;
+     tiling.statePageStride = statePageStride;
      tiling.numCacheLines = numCacheLines;
      tiling.batch = batch;
      return ge::GRAPH_SUCCESS;

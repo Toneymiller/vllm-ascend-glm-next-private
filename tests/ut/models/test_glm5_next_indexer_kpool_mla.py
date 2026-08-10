@@ -1234,7 +1234,7 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
-def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
+def test_indexer_kpool_mla_eager_state_write_trims_padded_values(
     mock_scatter,
     mock_get_forward_context,
 ):
@@ -1245,12 +1245,13 @@ def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
         size=(2, 4, 8),
         stride=(40, 8, 1),
     )
-    values = torch.arange(16, dtype=torch.bfloat16).view(2, 1, 8)
+    values = torch.arange(128 * 8, dtype=torch.bfloat16).view(128, 1, 8)
+    slots = torch.tensor([6] + [-1] * 15, dtype=torch.int64)
 
     AscendIndexerKPoolMLAImpl._store_indexer_cache(
         None,
         cache,
-        torch.tensor([6, -1], dtype=torch.int64),
+        slots,
         values,
     )
 
@@ -1259,9 +1260,13 @@ def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
     assert args[0] is cache
     torch.testing.assert_close(
         args[1],
-        torch.tensor([[1, 2]], dtype=torch.int64),
+        torch.tensor([[1, 2]] + [[0, 0]] * 15, dtype=torch.int64),
     )
-    torch.testing.assert_close(args[2], values[:1, 0])
+    torch.testing.assert_close(
+        args[2],
+        torch.cat([values[:1, 0], torch.zeros((15, 8), dtype=torch.bfloat16)]),
+    )
+    torch.testing.assert_close(cache[0, 0], torch.zeros_like(cache[0, 0]))
 
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
@@ -1345,19 +1350,19 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
         kv_cache=indexer_cache,
     )
     state_metadata = SimpleNamespace(
-        slot_mapping=torch.tensor([3, -1, -1, -1, -1, -1, -1]),
+        slot_mapping=torch.tensor([1, 2, 3, -1, -1, -1, -1]),
         block_table=torch.tensor([[0]], dtype=torch.int32),
         block_size=4,
     )
     indexer_metadata = SimpleNamespace(
-        slot_mapping=torch.tensor([0, -1, -1, -1, -1, -1, -1]),
+        slot_mapping=torch.tensor([-1, 0, -1, -1, -1, -1, -1]),
         block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(
-        num_actual_tokens=1,
-        cum_query_lens=torch.tensor([1], dtype=torch.int32),
+        num_actual_tokens=3,
+        cum_query_lens=torch.tensor([3], dtype=torch.int32),
         seq_lens=torch.tensor([4], dtype=torch.int32),
     )
     mock_get_forward_context.return_value = SimpleNamespace(
@@ -1394,10 +1399,17 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
     )
 
     torch.testing.assert_close(result, expected)
-    assert mock_compress.call_args.args[1].shape[0] == 1
-    assert mock_compress.call_args.args[4].shape[0] == 1
-    assert mock_lightning_indexer.call_args.args[0].shape[0] == 1
-    assert mock_lightning_indexer.call_args.args[6].shape[0] == 1
+    assert mock_compress.call_args.args[1].shape[0] == 3
+    torch.testing.assert_close(
+        mock_compress.call_args.args[4],
+        torch.tensor([0, 0, 0], dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        mock_compress.call_args.args[5],
+        torch.tensor([False, True, False]),
+    )
+    assert mock_lightning_indexer.call_args.args[0].shape[0] == 3
+    assert mock_lightning_indexer.call_args.args[6].shape[0] == 3
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
@@ -1838,6 +1850,38 @@ def test_indexer_kpool_mla_kpool_compress_returns_bfloat16_without_quant_scale()
     )
 
 
+def test_indexer_kpool_mla_kpool_compress_masks_writes_without_dynamic_rows():
+    indexer_cache = torch.full((1, 2, 1, 2), -7.0, dtype=torch.bfloat16)
+    slot_k = torch.tensor(
+        [
+            [[1.0, 3.0], [3.0, 1.0]],
+            [[9.0, 9.0], [9.0, 9.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    slot_score = torch.zeros_like(slot_k)
+
+    AscendSparseAttnIndexerKpool.kpool_compress_and_write_cache(
+        indexer_cache,
+        slot_k,
+        slot_score,
+        torch.zeros((2, 2), dtype=torch.float32),
+        torch.tensor([1, 0], dtype=torch.int64),
+        pool_size=2,
+        head_dim=2,
+        write_mask=torch.tensor([True, False]),
+    )
+
+    torch.testing.assert_close(
+        indexer_cache[0, 1, 0],
+        torch.tensor([2.0, 2.0], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        indexer_cache[0, 0, 0],
+        torch.full((2,), -7.0, dtype=torch.bfloat16),
+    )
+
+
 def test_glm5_next_kpool_compress_op_writes_paged_cache_like_reference():
     kv_cache = torch.full((2, 3, 1, 4), -7.0, dtype=torch.bfloat16)
     slot_k_storage = torch.arange(3 * 2 * 8, dtype=torch.float32).reshape(3, 2, 8)
@@ -1875,6 +1919,35 @@ def test_glm5_next_kpool_compress_op_writes_paged_cache_like_reference():
 
     assert result is None
     torch.testing.assert_close(kv_cache, expected_cache, rtol=1e-2, atol=1e-2)
+
+
+def test_glm5_next_kpool_compress_op_masks_fixed_shape_rows():
+    kv_cache = torch.full((1, 2, 1, 2), -7.0, dtype=torch.bfloat16)
+    slot_k = torch.tensor(
+        [
+            [[1.0, 3.0], [3.0, 1.0]],
+            [[9.0, 9.0], [9.0, 9.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    glm5_next_kpool_compress_and_write_cache(
+        kv_cache,
+        slot_k,
+        torch.zeros_like(slot_k),
+        torch.zeros((2, 2), dtype=torch.float32),
+        torch.tensor([1, 0], dtype=torch.int64),
+        torch.tensor([True, False]),
+    )
+
+    torch.testing.assert_close(
+        kv_cache[0, 1, 0],
+        torch.tensor([2.0, 2.0], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        kv_cache[0, 0, 0],
+        torch.full((2,), -7.0, dtype=torch.bfloat16),
+    )
 
 
 def test_indexer_kpool_mla_sparse_attention_pytorch_matches_golden_semantics():

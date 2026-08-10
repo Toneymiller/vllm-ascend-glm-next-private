@@ -36,6 +36,7 @@ ACLNN_API aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     bool safeGate,
     double lowerBound,
     bool stateVFirst,
+    int64_t stateBlockStride,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);

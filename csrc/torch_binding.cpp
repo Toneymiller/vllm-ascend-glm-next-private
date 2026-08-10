@@ -799,6 +799,12 @@ at::Tensor npu_causal_conv1d_custom(
     int64_t  pad_slot_id,
     int64_t  run_mode)
 {
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.stride(2) == 1 &&
+                    conv_state.stride(1) == conv_state.size(2) &&
+                    conv_state.stride(0) >= conv_state.size(1) * conv_state.size(2),
+                "npu_causal_conv1d_custom: conv_state must have contiguous [state_len,dim] rows and a "
+                "page stride of at least state_len*dim.");
+    const int64_t state_page_stride = conv_state.stride(0);
     EXEC_NPU_CMD(aclnnCausalConv1d,
                     x,
                     weight,
@@ -811,6 +817,7 @@ at::Tensor npu_causal_conv1d_custom(
                     activation_mode,
                     pad_slot_id,
                     run_mode,
+                    state_page_stride,
                     output
                 );
 

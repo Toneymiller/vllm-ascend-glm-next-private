@@ -65,6 +65,7 @@ public:
         NV_ = tilingData->nv;
         realV_ = tilingData->dv;
         stateCapacity_ = tilingData->sBlockNum;
+        stateBlockStride_ = tilingData->stateBlockStride;
         ssmStateStride_ = tilingData->ssmStateStride;
         scale_ = tilingData->scale;
         lowerBound_ = tilingData->lowerBound;
@@ -724,7 +725,7 @@ private:
         }
         uint64_t nextVOffset = 0;
         uint32_t nextSingleV = realV_ > vStep_ ? vStep_ : realV_;
-        uint64_t nextStateOffset = ((stateSlot * NV_ + head_i) * realV_) * realK_;
+        uint64_t nextStateOffset = stateSlot * stateBlockStride_ + head_i * realV_ * realK_;
         PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
@@ -732,7 +733,8 @@ private:
             nextVOffset = v_i + vStep_;
             if (nextVOffset < realV_) {
                 nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
-                nextStateOffset = ((stateSlot * NV_ + head_i) * realV_ + nextVOffset) * realK_;
+                nextStateOffset = stateSlot * stateBlockStride_ +
+                                  (head_i * realV_ + nextVOffset) * realK_;
                 PrefetchState(nextStateOffset, nextSingleV);
             }
             uint64_t pendingAttnOffset = 0;
@@ -745,7 +747,8 @@ private:
                 uint64_t curVOffset = static_cast<uint64_t>(seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (static_cast<uint64_t>(seq_i) * NV_ + head_i) * realV_ + v_i;
                 uint64_t curStateSlot = StateSlotForToken(batchIdx, seq0, seq_i);
-                uint64_t curStateOutOffset = ((curStateSlot * NV_ + head_i) * realV_ + v_i) * realK_;
+                uint64_t curStateOutOffset = curStateSlot * stateBlockStride_ +
+                                             (head_i * realV_ + v_i) * realK_;
                 beta_ = LoadBeta(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
                 if (attnOutBufferNum_ == BUFFER_NUM) {
@@ -831,6 +834,7 @@ private:
     uint32_t alignV_;
     uint32_t realV_;
     uint32_t stateCapacity_;
+    uint64_t stateBlockStride_;
     uint32_t ssmStateStride_;
     uint32_t vStep_;
     uint32_t stateOutBufferNum_;

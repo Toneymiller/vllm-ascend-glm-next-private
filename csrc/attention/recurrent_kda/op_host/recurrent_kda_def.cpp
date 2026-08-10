@@ -66,6 +66,7 @@ public:
         this->Attr("safe_gate").AttrType(OPTIONAL).Bool(false);
         this->Attr("lower_bound").AttrType(OPTIONAL).Float(-5.0);
         this->Attr("state_v_first").AttrType(OPTIONAL).Bool(true);
+        this->Attr("state_block_stride").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicConfig;
         aicConfig.DynamicCompileStaticFlag(true)

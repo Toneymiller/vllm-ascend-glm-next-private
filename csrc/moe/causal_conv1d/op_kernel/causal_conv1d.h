@@ -367,8 +367,8 @@
      if (hasInit) {
          for (int32_t i = 0; i < (width - 1); ++i) {
              const int32_t pos = stateTokenOffset + i;
-             const int64_t stateOffset =
-                 static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(pos) * dim + channelStart;
+             const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride +
+                                         static_cast<int64_t>(pos) * dim + channelStart;
              DataCopy(ring[(ringStart + i) * MAX_BLOCK_DIM], convStatesGm[stateOffset], baseDim);
          }
          SetFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
@@ -726,7 +726,8 @@
      const int32_t lastT = len - 1;
      LocalTensor<T> ring = inBuf.Get<T>();
      const int32_t lastSlot = SlotCurr(lastT);
-     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+     const int64_t stateBaseOffset =
+         static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + channelStart;
  
      for (int32_t pos = 0; pos < (width - 1); ++pos) {
          const int32_t tap = (width - 2) - pos;
@@ -767,17 +768,19 @@
          const int32_t srcPos0 = stateTokenOffset + 1;
          const int32_t srcPos1 = stateTokenOffset + 2;
          const int64_t srcOffset0 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(srcPos0) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride +
+             static_cast<int64_t>(srcPos0) * dim + channelStart;
          const int64_t srcOffset1 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(srcPos1) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride +
+             static_cast<int64_t>(srcPos1) * dim + channelStart;
          DataCopy(buf0, convStatesGm[srcOffset0], baseDim);
          DataCopy(buf1, convStatesGm[srcOffset1], baseDim);
          SetFlag<HardEvent::MTE2_MTE3>(stateShiftMte2ToMte3Event_);
          WaitFlag<HardEvent::MTE2_MTE3>(stateShiftMte2ToMte3Event_);
          const int64_t dstOffset0 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(0) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + channelStart;
          const int64_t dstOffset1 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(1) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + dim + channelStart;
          DataCopy(convStatesGm[dstOffset0], buf0, baseDim);
          DataCopy(convStatesGm[dstOffset1], buf1, baseDim);
          SetFlag<HardEvent::MTE3_MTE2>(stateShiftMte3ToMte2Event_);
@@ -787,9 +790,9 @@
          SetFlag<HardEvent::V_MTE3>(stateShiftVToMte3Event_);
          WaitFlag<HardEvent::V_MTE3>(stateShiftVToMte3Event_);
          const int64_t dstOffset0 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(0) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + channelStart;
          const int64_t dstOffset1 =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(1) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride + dim + channelStart;
          DataCopy(convStatesGm[dstOffset0], buf0, baseDim);
          DataCopy(convStatesGm[dstOffset1], buf0, baseDim);
          SetFlag<HardEvent::MTE3_MTE2>(stateShiftMte3ToMte2Event_);
@@ -818,7 +821,8 @@
          }
  
          const int64_t dstOffset =
-             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(keep + t) * dim + channelStart;
+             static_cast<int64_t>(cacheIdx) * tilingData_->statePageStride +
+             static_cast<int64_t>(keep + t) * dim + channelStart;
          DataCopy(convStatesGm[dstOffset], currBuf, baseDim);
          SetFlag<HardEvent::MTE3_MTE2>(specWritebackMte3ToMte2Event_[curr]);
      }
