@@ -51,7 +51,10 @@ from vllm_ascend.models.glm5_next import (
     SparseAttnIndexerKpool,
 )
 from vllm_ascend.ops.glm5_next_kpool_compress import glm5_next_kpool_compress_and_write_cache
-from vllm_ascend.ops.glm5_next_lightning_indexer import glm5_next_lightning_indexer
+from vllm_ascend.ops.glm5_next_lightning_indexer import (
+    _gather_indexer_k_cache,
+    glm5_next_lightning_indexer,
+)
 from vllm_ascend.ops.indexer_kpool_mla import (
     AscendIndexerKPoolMLAAttention,
     IndexerKPoolMLACacheLayer,
@@ -1300,10 +1303,45 @@ def test_indexer_kpool_mla_paged_write_preserves_physical_page_stride(
     assert raw_cache[4:8].tolist() == [0.0] * 4
 
 
-def test_glm5_indexer_paged_write_preserves_physical_page_stride():
-    raw_cache = torch.zeros(16, dtype=torch.bfloat16)
+@patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
+@patch("torch_npu.npu_scatter_nd_update_", create=True)
+def test_indexer_kpool_mla_graph_write_handles_offset_padded_storage(
+    mock_scatter,
+    mock_get_forward_context,
+):
+    mock_get_forward_context.return_value = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL
+    )
+    raw_cache = torch.zeros(20, dtype=torch.bfloat16)
     cache = torch.as_strided(
-        raw_cache,
+        raw_cache[2:],
+        size=(2, 2, 1, 2),
+        stride=(8, 2, 2, 1),
+    )
+    values = torch.tensor(
+        [[[3.0, 4.0]], [[9.0, 9.0]]],
+        dtype=torch.bfloat16,
+    )
+
+    AscendIndexerKPoolMLAImpl._scatter_paged_cache(
+        cache,
+        torch.tensor([3, -1], dtype=torch.int64),
+        values,
+        block_size=2,
+    )
+
+    mock_scatter.assert_not_called()
+    torch.testing.assert_close(cache[1, 1], values[0])
+    torch.testing.assert_close(cache[0, 0], torch.zeros_like(cache[0, 0]))
+    assert raw_cache[:2].tolist() == [0.0, 0.0]
+    assert raw_cache[6:10].tolist() == [0.0] * 4
+    assert raw_cache[14:].tolist() == [0.0] * 6
+
+
+def test_glm5_indexer_paged_write_preserves_physical_page_stride():
+    raw_cache = torch.zeros(20, dtype=torch.bfloat16)
+    cache = torch.as_strided(
+        raw_cache[2:],
         size=(2, 2, 1, 2),
         stride=(8, 2, 2, 1),
     )
@@ -1321,7 +1359,26 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
     torch.testing.assert_close(cache[1, 0], values[0])
     torch.testing.assert_close(cache[0, 0], torch.zeros_like(cache[0, 0]))
-    assert raw_cache[4:8].tolist() == [0.0] * 4
+    assert raw_cache[:2].tolist() == [0.0, 0.0]
+    assert raw_cache[6:10].tolist() == [0.0] * 4
+    assert raw_cache[14:].tolist() == [0.0] * 6
+
+
+def test_glm5_indexer_graph_row_write_restores_valid_zero_slot():
+    cache = torch.zeros((4, 2), dtype=torch.bfloat16)
+    values = torch.tensor(
+        [[5.0, 6.0], [9.0, 9.0], [8.0, 8.0]],
+        dtype=torch.bfloat16,
+    )
+
+    AscendSparseAttnIndexerKpool._scatter_rows_graph_safe(
+        cache,
+        torch.tensor([0, -1, 99], dtype=torch.int64),
+        values,
+    )
+
+    torch.testing.assert_close(cache[0], values[0])
+    torch.testing.assert_close(cache[1:], torch.zeros_like(cache[1:]))
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
@@ -1782,6 +1839,46 @@ def test_glm5_next_lightning_indexer_matches_reference_chain():
     assert result.shape == (2, 1, index_topk + index_kpool - 1)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(indexer_cache, indexer_cache_before)
+
+
+def test_gather_indexer_k_cache_preserves_physical_page_stride():
+    physical_cache = torch.full(
+        (2, 4, 1, 2),
+        -1,
+        dtype=torch.bfloat16,
+    )
+    physical_cache[0, :2, 0] = torch.tensor(
+        [[1, 2], [3, 4]],
+        dtype=torch.bfloat16,
+    )
+    physical_cache[1, :2, 0] = torch.tensor(
+        [[5, 6], [7, 8]],
+        dtype=torch.bfloat16,
+    )
+    logical_cache = physical_cache.as_strided(
+        (2, 2, 1, 2),
+        physical_cache.stride(),
+    )
+    block_table = torch.tensor(
+        [[1], [0]],
+        dtype=torch.int32,
+    )
+    output = torch.empty((4, 2), dtype=torch.bfloat16)
+
+    _gather_indexer_k_cache(
+        logical_cache,
+        output,
+        block_table,
+        keys_per_row=2,
+    )
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor(
+            [[5, 6], [7, 8], [1, 2], [3, 4]],
+            dtype=torch.bfloat16,
+        ),
+    )
 
 
 def test_glm5_next_lightning_indexer_fallback_aligns_cache_block_chunks():

@@ -123,24 +123,31 @@ def _validate_common_inputs(
 
 def _gather_indexer_k_cache(
     indexer_cache: torch.Tensor,
-    dst_k: torch.Tensor,
     block_table: torch.Tensor,
-    cu_seq_lens: torch.Tensor,
-) -> None:
-    if dst_k.shape[0] == 0:
-        return
-
-    output_rows = torch.arange(
-        dst_k.shape[0],
-        dtype=cu_seq_lens.dtype,
-        device=dst_k.device,
-    )
-    request_ids = torch.bucketize(
+    keys_per_row: int,
+) -> torch.Tensor:
+    output_rows = block_table.shape[0] * keys_per_row
+    output_shape = (
         output_rows,
-        cu_seq_lens[1:],
-        right=True,
+        indexer_cache.shape[2] * indexer_cache.shape[3],
     )
-    logical_indices = output_rows - cu_seq_lens[request_ids]
+    if output_rows == 0:
+        return torch.empty(
+            output_shape,
+            dtype=indexer_cache.dtype,
+            device=indexer_cache.device,
+        )
+    if block_table.shape[0] == 0:
+        raise ValueError(
+            "GLM5 Next indexer block table must contain a row when the "
+            "gather output is non-empty."
+        )
+
+    logical_indices = torch.arange(
+        keys_per_row,
+        dtype=torch.int64,
+        device=indexer_cache.device,
+    )
     cache_block_size = indexer_cache.shape[1]
     logical_pages = torch.div(
         logical_indices,
@@ -148,21 +155,91 @@ def _gather_indexer_k_cache(
         rounding_mode="floor",
     )
     page_offsets = torch.remainder(logical_indices, cache_block_size)
-    physical_blocks = block_table[
-        request_ids,
-        logical_pages,
-    ].to(torch.int64)
+    block_table_slots = (
+        torch.arange(
+            block_table.shape[0],
+            dtype=torch.int64,
+            device=indexer_cache.device,
+        )[:, None]
+        * block_table.shape[1]
+        + logical_pages[None, :]
+    )
+    physical_blocks = block_table.reshape(-1).index_select(
+        0,
+        block_table_slots.reshape(-1),
+    ).to(torch.int64)
     safe_physical_blocks = physical_blocks.clamp(
         min=0,
         max=indexer_cache.shape[0] - 1,
     )
-    gathered_k = indexer_cache[
-        safe_physical_blocks,
-        page_offsets,
-        0,
-        :,
-    ]
-    dst_k.copy_(gathered_k)
+
+    cache_page_stride = indexer_cache.stride(0)
+    cache_row_stride = indexer_cache.stride(1)
+    cache_row_width = indexer_cache.shape[2] * indexer_cache.shape[3]
+    if (
+        indexer_cache.stride(3) != 1
+        or indexer_cache.stride(2) != indexer_cache.shape[3]
+    ):
+        raise RuntimeError(
+            "GLM5 Next indexer cache rows must have contiguous trailing "
+            "dimensions."
+        )
+    if cache_row_stride < cache_row_width:
+        raise RuntimeError(
+            "GLM5 Next indexer cache row stride is smaller than its row."
+        )
+
+    if cache_page_stride % cache_row_stride == 0:
+        physical_rows_per_page = cache_page_stride // cache_row_stride
+        if physical_rows_per_page < cache_block_size:
+            raise RuntimeError(
+                "GLM5 Next indexer physical page is smaller than its "
+                "logical block size."
+            )
+        physical_num_rows = (
+            (indexer_cache.shape[0] - 1) * physical_rows_per_page
+            + cache_block_size
+        )
+        physical_cache_rows = indexer_cache.as_strided(
+            (physical_num_rows, cache_row_width),
+            (cache_row_stride, 1),
+        )
+        physical_cache_indices = (
+            safe_physical_blocks * physical_rows_per_page
+            + page_offsets.repeat(block_table.shape[0])
+        )
+        gathered_k = physical_cache_rows.index_select(
+            0,
+            physical_cache_indices,
+        )
+    else:
+        max_cache_row_offset = (
+            (indexer_cache.shape[0] - 1) * cache_page_stride
+            + (cache_block_size - 1) * cache_row_stride
+        )
+        physical_cache_storage = indexer_cache.as_strided(
+            (max_cache_row_offset + cache_row_width,),
+            (1,),
+        )
+        cache_element_offsets = torch.arange(
+            cache_row_width,
+            dtype=torch.int64,
+            device=indexer_cache.device,
+        )
+        physical_cache_row_offsets = (
+            safe_physical_blocks * cache_page_stride
+            + page_offsets.repeat(block_table.shape[0]) * cache_row_stride
+        )
+        physical_cache_element_offsets = (
+            physical_cache_row_offsets.unsqueeze(-1)
+            + cache_element_offsets
+        )
+        gathered_k = physical_cache_storage.index_select(
+            0,
+            physical_cache_element_offsets.reshape(-1),
+        ).reshape(output_rows, cache_row_width)
+
+    return gathered_k.reshape(output_shape)
 
 
 def _bf16_mqa_logits(
@@ -238,7 +315,10 @@ def _pool_topk(
         device=query.device,
     )
     request_ids = torch.bucketize(token_ids, cum_query_lens, right=True)
-    request_pool_lens = indexer_seq_lens[request_ids].to(torch.int64)
+    request_pool_lens = indexer_seq_lens.index_select(
+        0,
+        request_ids,
+    ).to(torch.int64)
     causal_pool_lens = torch.div(
         positions.to(torch.int64) + 1,
         index_kpool,
@@ -287,22 +367,16 @@ def _pool_topk(
                 )
                 * keys_per_row
             )
-            gathered_key = torch.empty(
-                (chunk_rows * keys_per_row, query.shape[-1]),
-                dtype=torch.bfloat16,
-                device=query.device,
-            )
             first_page = key_start // cache_block_size
             last_page = (key_end + cache_block_size - 1) // cache_block_size
-            chunk_block_table = indexer_block_table[
+            chunk_block_table = indexer_block_table.index_select(
+                0,
                 chunk_request_ids,
-                first_page:last_page,
-            ]
-            _gather_indexer_k_cache(
+            )[:, first_page:last_page]
+            gathered_key = _gather_indexer_k_cache(
                 indexer_cache,
-                gathered_key,
                 chunk_block_table,
-                gather_cu_seq_lens,
+                keys_per_row,
             )
 
             cu_seqlen_ks = gather_cu_seq_lens[:-1]

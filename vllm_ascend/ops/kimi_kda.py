@@ -46,8 +46,44 @@ def _gather_state_rows(
     """Gather only the recurrent payload for active cache rows."""
     del page_base_state
     indices = state_indices.flatten().to(torch.long)
-    selected_state = state.index_select(0, indices).contiguous()
-    return selected_state, (state, None, indices, 0)
+    row_width = state[0].numel()
+    expected_stride = 1
+    for size, stride in zip(
+        reversed(state.shape[1:]),
+        reversed(state.stride()[1:]),
+    ):
+        if size != 1 and stride != expected_stride:
+            raise RuntimeError(
+                "KDA recurrent state payload dimensions must be contiguous."
+            )
+        expected_stride *= size
+
+    page_stride = state.stride(0)
+    if page_stride < row_width:
+        raise RuntimeError(
+            "KDA recurrent state page stride is smaller than its payload."
+        )
+
+    physical_storage_size = (
+        (state.shape[0] - 1) * page_stride + row_width
+    )
+    physical_state = state.as_strided(
+        (physical_storage_size,),
+        (1,),
+    )
+    element_offsets = (
+        indices[:, None] * page_stride
+        + torch.arange(
+            row_width,
+            dtype=torch.long,
+            device=state.device,
+        )[None, :]
+    ).reshape(-1)
+    selected_state = physical_state.index_select(
+        0,
+        element_offsets,
+    ).reshape(indices.shape[0], *state.shape[1:])
+    return selected_state, (state, None, indices, -2)
 
 
 def _restore_state_rows(
@@ -56,7 +92,23 @@ def _restore_state_rows(
 ) -> None:
     state_or_pages, selected_pages, indices, state_offset = restore_metadata
     if selected_pages is None:
-        state_or_pages.index_copy_(0, indices, updated_state)
+        if state_offset == -2:
+            if state_or_pages.device.type == "npu":
+                torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                    state_or_pages,
+                    indices.unsqueeze(-1),
+                    updated_state,
+                )
+            else:
+                state_or_pages.index_copy_(0, indices, updated_state)
+        elif state_offset == -1:
+            state_or_pages.index_copy_(
+                0,
+                indices,
+                updated_state.reshape(-1),
+            )
+        else:
+            state_or_pages.index_copy_(0, indices, updated_state)
         return
 
     selected_pages.narrow(1, state_offset, updated_state[0].numel()).copy_(

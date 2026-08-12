@@ -438,7 +438,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
         # Avoid aclnnScatterNdUpdateV2 in ACLGraph capture. Padded rows use
         # row zero as a fixed-shape sentinel and it is restored immediately.
-        cache_rows[safe_slots] = safe_values
+        cache_rows.index_copy_(0, safe_slots, safe_values)
         cache_rows[0].copy_(expected_zero)
 
     @staticmethod
@@ -475,7 +475,37 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             update_zero,
             row_zero,
         )
-        cache[block_ids, block_offsets] = safe_values
+        # Preserve the physical page gap while avoiding tensor advanced
+        # assignment, whose aten::index read can consume transient offsets
+        # during ACLGraph capture with TASK_QUEUE_ENABLE=1.
+        row_stride = cache.stride(1)
+        page_stride = cache.stride(0)
+        if page_stride % row_stride != 0:
+            raise RuntimeError(
+                "GLM-5 Indexer cache page stride must be a multiple of its "
+                "row stride."
+            )
+        physical_rows_per_page = page_stride // row_stride
+        if physical_rows_per_page < block_size:
+            raise RuntimeError(
+                "GLM-5 Indexer physical page is smaller than its logical "
+                "block size."
+            )
+        physical_num_rows = (
+            (cache.shape[0] - 1) * physical_rows_per_page + block_size
+        )
+        physical_cache_rows = cache.as_strided(
+            (physical_num_rows, *cache.shape[2:]),
+            (row_stride, *cache.stride()[2:]),
+        )
+        physical_slots = (
+            block_ids * physical_rows_per_page + block_offsets
+        )
+        physical_cache_rows.index_copy_(
+            0,
+            physical_slots,
+            safe_values,
+        )
         cache[0, 0].copy_(expected_zero)
 
     def _gather_compressor_state(

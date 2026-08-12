@@ -624,7 +624,35 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             row_zero,
         )
         if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            cache[block_ids, block_offsets] = safe_values
+            # Tensor advanced assignment lowers to aten::index before the
+            # write. With TASK_QUEUE_ENABLE=1 that Index can observe the
+            # temporary block_offsets buffer before its graph task completes.
+            # Address the same rows through a stable one-dimensional view so
+            # ACLGraph records a single index_copy dependency instead.
+            row_stride = cache.stride(1)
+            page_stride = cache.stride(0)
+            if page_stride % row_stride != 0:
+                raise RuntimeError(
+                    "Indexer KPool cache page stride must be a multiple of "
+                    "its row stride."
+                )
+            physical_rows_per_page = page_stride // row_stride
+            if physical_rows_per_page < block_size:
+                raise RuntimeError(
+                    "Indexer KPool physical page is smaller than its logical "
+                    "block size."
+                )
+            physical_num_rows = (
+                (cache.shape[0] - 1) * physical_rows_per_page + block_size
+            )
+            physical_cache_rows = cache.as_strided(
+                (physical_num_rows, *cache.shape[2:]),
+                (row_stride, *cache.stride()[2:]),
+            )
+            physical_slots = (
+                block_ids * physical_rows_per_page + block_offsets
+            )
+            physical_cache_rows.index_copy_(0, physical_slots, safe_values)
         else:
             indices = torch.stack([block_ids, block_offsets], dim=-1)
             torch_npu.npu_scatter_nd_update_(cache, indices, safe_values)
@@ -892,6 +920,61 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         num_block_columns = block_table.shape[1]
         score_mask_value = torch.finfo(torch.float32).min
 
+        # Avoid multi-dimensional advanced indexing in FULL ACLGraph. With
+        # TASK_QUEUE_ENABLE=1, its IndexCheck task can consume page offsets
+        # before the producer task has completed. Flatten both paged tensors
+        # and use one-dimensional index_select operations with explicit data
+        # dependencies instead. The cache view must retain any physical page
+        # padding introduced by the shared KV-cache allocator.
+        block_table_flat = block_table.reshape(-1)
+        cache_page_stride = packed_kv_cache.stride(0)
+        cache_row_stride = packed_kv_cache.stride(1)
+        cache_row_width = packed_kv_cache.shape[2] * packed_kv_cache.shape[3]
+        if (
+            packed_kv_cache.stride(3) != 1
+            or packed_kv_cache.stride(2) != packed_kv_cache.shape[3]
+        ):
+            raise RuntimeError(
+                "Indexer KPool MLA cache rows must have contiguous trailing "
+                "dimensions."
+            )
+        if cache_row_stride < cache_row_width:
+            raise RuntimeError(
+                "Indexer KPool MLA cache row stride is smaller than its row."
+            )
+        if cache_page_stride % cache_row_stride == 0:
+            physical_rows_per_page = cache_page_stride // cache_row_stride
+            if physical_rows_per_page < block_size:
+                raise RuntimeError(
+                    "Indexer KPool MLA physical page is smaller than its "
+                    "logical block size."
+                )
+            physical_num_rows = (
+                (packed_kv_cache.shape[0] - 1) * physical_rows_per_page
+                + block_size
+            )
+            physical_cache_rows = packed_kv_cache.as_strided(
+                (physical_num_rows, cache_row_width),
+                (cache_row_stride, 1),
+            )
+            physical_cache_storage = None
+            cache_element_offsets = None
+        else:
+            max_cache_row_offset = (
+                (packed_kv_cache.shape[0] - 1) * cache_page_stride
+                + (block_size - 1) * cache_row_stride
+            )
+            physical_cache_rows = None
+            physical_cache_storage = packed_kv_cache.as_strided(
+                (max_cache_row_offset + cache_row_width,),
+                (1,),
+            )
+            cache_element_offsets = torch.arange(
+                cache_row_width,
+                dtype=torch.int64,
+                device=packed_kv_cache.device,
+            )
+
         for query_start in range(
             0,
             num_actual_tokens,
@@ -926,10 +1009,15 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
                 safe_token_indices,
                 block_size,
             )
-            physical_blocks = block_table[
-                chunk_request_ids[:, None],
-                safe_logical_pages,
-            ].to(torch.int64)
+            block_table_slots = (
+                chunk_request_ids[:, None].to(torch.int64)
+                * num_block_columns
+                + safe_logical_pages.to(torch.int64)
+            )
+            physical_blocks = block_table_flat.index_select(
+                0,
+                block_table_slots.reshape(-1),
+            ).reshape(block_table_slots.shape).to(torch.int64)
             valid &= physical_blocks >= 0
             valid &= physical_blocks < packed_kv_cache.shape[0]
             safe_physical_blocks = physical_blocks.clamp(
@@ -937,14 +1025,34 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
                 max=packed_kv_cache.shape[0] - 1,
             )
 
-            # Index both page dimensions so padded physical-page strides are
-            # preserved. Advanced indexing materializes a contiguous [C,K,D]
-            # result without requiring the source cache itself to be contiguous.
-            gathered_packed_kv = packed_kv_cache[
-                safe_physical_blocks,
-                page_offsets,
-                0,
-            ]
+            if physical_cache_rows is not None:
+                physical_cache_indices = (
+                    safe_physical_blocks * physical_rows_per_page
+                    + page_offsets
+                )
+                gathered_packed_kv = physical_cache_rows.index_select(
+                    0,
+                    physical_cache_indices.reshape(-1),
+                )
+            else:
+                assert physical_cache_storage is not None
+                assert cache_element_offsets is not None
+                physical_cache_row_offsets = (
+                    safe_physical_blocks * cache_page_stride
+                    + page_offsets * cache_row_stride
+                )
+                physical_cache_element_offsets = (
+                    physical_cache_row_offsets.unsqueeze(-1)
+                    + cache_element_offsets
+                )
+                gathered_packed_kv = physical_cache_storage.index_select(
+                    0,
+                    physical_cache_element_offsets.reshape(-1),
+                )
+            gathered_packed_kv = gathered_packed_kv.reshape(
+                *safe_physical_blocks.shape,
+                *packed_kv_cache.shape[2:],
+            )[..., 0, :]
             gathered_kv, gathered_rope = gathered_packed_kv.split(
                 [
                     ql_nope.shape[-1],
