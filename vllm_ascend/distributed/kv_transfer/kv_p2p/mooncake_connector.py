@@ -882,13 +882,71 @@ class KVCacheRecvingThread(threading.Thread):
             tp_num_need_pulls = group_pull.num_group_pulls
             inner_offset = group_pull.remote_tp_offset
             is_mamba_group = group_spec["kv_cache_spec_type"] == "MambaSpec"
+            is_state_group = is_mamba_group or group_spec.get("cache_role") in (
+                "state",
+                "indexer_state",
+            )
             block_id_idx = group_idx if use_transfer_group_block_ids else kv_cache_group_id
             local_group_block_ids = local_block_ids[block_id_idx]
             remote_group_block_ids = remote_block_ids[block_id_idx]
             has_group_blocks = bool(local_group_block_ids)
-            if not has_group_blocks and (is_mamba_group or not has_replicate_k_blocks):
+            logger.debug(
+                "Mooncake transfer group blocks: request_id=%s group_idx=%s kv_cache_group_id=%s "
+                "cache_role=%s spec_type=%s local_block_ids=%s remote_block_ids=%s "
+                "tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
+                remote_request_id,
+                group_idx,
+                kv_cache_group_id,
+                group_spec.get("cache_role", "kv"),
+                group_spec["kv_cache_spec_type"],
+                local_group_block_ids,
+                remote_group_block_ids,
+                tp_num_need_pulls,
+                inner_offset,
+                session_id,
+            )
+            if not has_group_blocks and (is_state_group or not has_replicate_k_blocks):
                 continue
-            if not is_mamba_group:
+            if is_state_group:
+                # State caches contain the current recurrent/tail state rather than
+                # context blocks. P and D may therefore own a different number of
+                # logical state blocks. Transfer only the latest valid P-side state
+                # into D's active state block. Mamba keeps its first-block convention
+                # and dedicated multi-tensor layout; indexer_state selects the latest
+                # D-side tail page and uses the regular single-tensor address path.
+                transfer_block_idx = len(remote_group_block_ids) - self.num_speculative_tokens - 1
+                if transfer_block_idx < 0:
+                    raise RuntimeError(
+                        "No valid remote state block for Mooncake transfer: "
+                        f"request_id={remote_request_id}, group_idx={group_idx}, "
+                        f"kv_cache_group_id={kv_cache_group_id}, "
+                        f"cache_role={group_spec.get('cache_role', 'kv')}, "
+                        f"remote_block_ids={remote_group_block_ids}, "
+                        f"num_speculative_tokens={self.num_speculative_tokens}"
+                    )
+                grouped_remote_block_ids = [[remote_group_block_ids[transfer_block_idx]]]
+                local_state_block_id = local_group_block_ids[0] if is_mamba_group else local_group_block_ids[-1]
+                grouped_local_block_ids = [[local_state_block_id]]
+                state_selection_log = logger.debug if is_mamba_group else logger.info
+                state_selection_log(
+                    "Mooncake state transfer selection: request_id=%s group_idx=%s "
+                    "kv_cache_group_id=%s cache_role=%s spec_type=%s "
+                    "local_block_count=%s remote_block_count=%s selected_local_block_id=%s "
+                    "selected_remote_block_id=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
+                    remote_request_id,
+                    group_idx,
+                    kv_cache_group_id,
+                    group_spec.get("cache_role", "kv"),
+                    group_spec["kv_cache_spec_type"],
+                    len(local_group_block_ids),
+                    len(remote_group_block_ids),
+                    grouped_local_block_ids[0][0],
+                    grouped_remote_block_ids[0][0],
+                    tp_num_need_pulls,
+                    inner_offset,
+                    session_id,
+                )
+            else:
                 grouped_remote_block_ids: list[list[int]] = []
                 grouped_local_block_ids: list[list[int]] = []
                 if has_group_blocks:
@@ -897,6 +955,18 @@ class KVCacheRecvingThread(threading.Thread):
                     # _get_kv_split_metadata, so consume them directly here.
                     kernel_remote_block_ids = remote_group_block_ids
                     kernel_local_block_ids = local_group_block_ids
+                    if len(kernel_remote_block_ids) != len(kernel_local_block_ids):
+                        raise RuntimeError(
+                            "Mooncake attention transfer block count mismatch: "
+                            f"request_id={remote_request_id}, group_idx={group_idx}, "
+                            f"kv_cache_group_id={kv_cache_group_id}, "
+                            f"cache_role={group_spec.get('cache_role', 'kv')}, "
+                            f"spec_type={group_spec['kv_cache_spec_type']}, "
+                            f"local_block_ids={kernel_local_block_ids}, "
+                            f"remote_block_ids={kernel_remote_block_ids}, "
+                            f"tp_num_need_pulls={tp_num_need_pulls}, "
+                            f"remote_tp_offset={inner_offset}, session_id={session_id}"
+                        )
 
                     if tp_num_need_pulls == 1:
                         grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
@@ -911,12 +981,6 @@ class KVCacheRecvingThread(threading.Thread):
                             is_group_transfer_end,
                         )
                     )
-            else:
-                # When Prefix Caching is enabled on both P and D nodes, num_block should not be forced to match,
-                # as the D-node requires dynamic allocation based on its specific cache hit rate.
-                transfer_block_idx = len(remote_group_block_ids) - self.num_speculative_tokens - 1
-                grouped_remote_block_ids = [[remote_group_block_ids[transfer_block_idx]]]
-                grouped_local_block_ids = [[local_group_block_ids[0]]]
 
             if is_mamba_group:
                 for layer_idx in layer_indices:
@@ -981,7 +1045,34 @@ class KVCacheRecvingThread(threading.Thread):
                             dst_block_stride=block_stride,
                             block_len=inner_block_len,
                         )
+                    if len(transfer_remote_block_ids) != len(transfer_local_block_ids):
+                        raise RuntimeError(
+                            "Mooncake transfer block group count mismatch: "
+                            f"request_id={remote_request_id}, group_idx={group_idx}, "
+                            f"kv_cache_group_id={kv_cache_group_id}, "
+                            f"cache_role={group_spec.get('cache_role', 'kv')}, "
+                            f"layer_idx={layer_idx}, cache_idx={cache_idx}, "
+                            f"remote_groups={transfer_remote_block_ids}, "
+                            f"local_groups={transfer_local_block_ids}, "
+                            f"tp_num_need_pulls={tp_num_need_pulls}, remote_tp_offset={inner_offset}, "
+                            f"block_len={block_len}, inner_block_len={inner_block_len}, "
+                            f"local_block_stride={block_stride}, remote_block_stride={remote_block_stride}"
+                        )
                     for remote_block_id, local_block_id in zip(transfer_remote_block_ids, transfer_local_block_ids):
+                        if not remote_block_id or not local_block_id:
+                            raise RuntimeError(
+                                "Mooncake transfer contains an empty block subgroup: "
+                                f"request_id={remote_request_id}, group_idx={group_idx}, "
+                                f"kv_cache_group_id={kv_cache_group_id}, "
+                                f"cache_role={group_spec.get('cache_role', 'kv')}, "
+                                f"layer_idx={layer_idx}, cache_idx={cache_idx}, "
+                                f"remote_block_ids={remote_block_id}, local_block_ids={local_block_id}, "
+                                f"all_remote_groups={transfer_remote_block_ids}, "
+                                f"all_local_groups={transfer_local_block_ids}, "
+                                f"tp_num_need_pulls={tp_num_need_pulls}, remote_tp_offset={inner_offset}, "
+                                f"block_len={block_len}, inner_block_len={inner_block_len}, "
+                                f"local_block_stride={block_stride}, remote_block_stride={remote_block_stride}"
+                            )
                         src = src_layer_base_addr + local_block_id[0] * block_stride + inner_offset * inner_block_len
                         dst = dst_layer_base_addr + remote_block_id[0] * remote_block_stride
                         length = inner_block_len * len(local_block_id)
@@ -1433,7 +1524,7 @@ class KVCacheRecvingThread(threading.Thread):
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
             if agent_meta.kv_group2layeridx != self.kv_group2layeridx:
-                logger.warning(
+                logger.debug(
                     "Remote kv_group2layeridx is inconsistent with local. remote=%s, local=%s. ",
                     agent_meta.kv_group2layeridx,
                     self.kv_group2layeridx,
@@ -4118,6 +4209,11 @@ def group_concurrent_contiguous(
     block_len: int = 1,
 ) -> tuple[list[list[int]], list[list[int]]]:
     """Group block ids that are contiguous in both id space and memory."""
+    if len(src) != len(dst):
+        raise ValueError(
+            "Cannot group Mooncake block ids with different lengths: "
+            f"src_len={len(src)}, dst_len={len(dst)}, src={src}, dst={dst}"
+        )
     src_indices: npt.NDArray[np.int64] = np.array(src, dtype=np.int64)
     dst_indices: npt.NDArray[np.int64] = np.array(dst, dtype=np.int64)
 

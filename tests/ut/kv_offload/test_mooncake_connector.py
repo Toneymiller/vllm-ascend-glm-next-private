@@ -1148,6 +1148,34 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_indexer_state_selects_latest_remote_block(self, mock_get_meta):
+        req = dict(self.test_req)
+        req["local_block_ids"] = [[2, 3]]
+        req["remote_block_ids"] = [[7, 8, 9]]
+        self.thread.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendIndexerKPoolStateSpec",
+                    "cache_role": "indexer_state",
+                    "kv_cache_group_id": 0,
+                },
+                [0],
+            )
+        }
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
+            mock_config.return_value.enable_kv_nz = False
+            self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
+            self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1]]}
+            self.thread._transfer_kv_cache_all_groups(req)
+
+        call_args, _ = self.engine.batch_transfer_sync_read.call_args
+        self.assertEqual(call_args[1], [0x1000 + 3 * 1024])
+        self.assertEqual(call_args[2], [0x3000 + 9 * 1024])
+        self.assertEqual(call_args[3], [1024])
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_prefix_cache_offset_uses_compress_ratio(self, mock_get_meta):
         req = dict(self.test_req)
         req["local_block_ids"] = [[1, 2]]
@@ -1639,6 +1667,10 @@ class TestHelperFunctions(unittest.TestCase):
         src_groups, dst_groups = group_concurrent_contiguous(src, dst)
         self.assertEqual(src_groups, [])
         self.assertEqual(dst_groups, [])
+
+    def test_group_concurrent_contiguous_rejects_mismatched_lengths(self):
+        with self.assertRaisesRegex(ValueError, "different lengths"):
+            group_concurrent_contiguous([1, 2], [10])
 
     def test_group_concurrent_contiguous_uses_stride_for_memory_contiguity(self):
         src: list[int] = [1, 2]
