@@ -1304,10 +1304,85 @@ class KVCacheRecvingThread(threading.Thread):
         conv_shape = group_spec["shapes"][0]
         conv_dtype_size = group_spec["dtype_sizes"][0]
 
-        linear_key_head_dim = self.vllm_config.model_config.hf_text_config.linear_key_head_dim
-        linear_num_key_heads = self.vllm_config.model_config.hf_text_config.linear_num_key_heads
-        linear_value_head_dim = self.vllm_config.model_config.hf_text_config.linear_value_head_dim
-        linear_num_value_heads = self.vllm_config.model_config.hf_text_config.linear_num_value_heads
+        hf_text_config = self.vllm_config.model_config.hf_text_config
+        linear_layout_fields = (
+            "linear_key_head_dim",
+            "linear_num_key_heads",
+            "linear_value_head_dim",
+            "linear_num_value_heads",
+        )
+        if not all(hasattr(hf_text_config, field) for field in linear_layout_fields):
+            model_type = str(getattr(hf_text_config, "model_type", ""))
+            if not model_type.startswith("glm5_next"):
+                missing_fields = [
+                    field for field in linear_layout_fields if not hasattr(hf_text_config, field)
+                ]
+                raise RuntimeError(
+                    "Cannot split Mamba cache across TP ranks without a known "
+                    f"physical layout: model_type={model_type!r}, missing_fields={missing_fields}."
+                )
+
+            # GLM5Next GDN state is physically TP-sharded by concatenation:
+            # conv is split along its final axis and SSM along its first axis.
+            # Field logs from the deployed model show P(TP4) shapes
+            # (3, 6144)/(16, 128, 128) and D(TP2) shapes
+            # (3, 12288)/(32, 128, 128), respectively. Derive the copy
+            # segments from those per-layer specs instead of borrowing the
+            # MiniMax-M3 K/K/V layout fields.
+            ssm_shape = group_spec["shapes"][1]
+            ssm_dtype_size = group_spec["dtype_sizes"][1]
+            expected_local_conv_len = math.prod(conv_shape) * conv_dtype_size
+            expected_local_ssm_len = math.prod(ssm_shape) * ssm_dtype_size
+            if local_conv_len != expected_local_conv_len or local_ssm_len != expected_local_ssm_len:
+                raise RuntimeError(
+                    "GLM5Next Mamba cache metadata does not match its per-layer spec: "
+                    f"conv_shape={conv_shape}, conv_dtype_size={conv_dtype_size}, "
+                    f"local_conv_len={local_conv_len}, expected_conv_len={expected_local_conv_len}, "
+                    f"ssm_shape={ssm_shape}, ssm_dtype_size={ssm_dtype_size}, "
+                    f"local_ssm_len={local_ssm_len}, expected_ssm_len={expected_local_ssm_len}."
+                )
+            if conv_shape[-1] % tp_ratio != 0 or local_ssm_len % tp_ratio != 0:
+                raise RuntimeError(
+                    "GLM5Next Mamba cache cannot be evenly split across remote TP ranks: "
+                    f"conv_shape={conv_shape}, local_ssm_len={local_ssm_len}, tp_ratio={tp_ratio}."
+                )
+
+            remote_conv_width = conv_shape[-1] // tp_ratio
+            conv_rows = math.prod(conv_shape[:-1])
+            for row_idx in range(conv_rows):
+                local_addr_offset = (
+                    row_idx * conv_shape[-1] + remote_tp_offset * remote_conv_width
+                ) * conv_dtype_size
+                remote_addr_offset = row_idx * remote_conv_width * conv_dtype_size
+                src_list.append(local_conv_addr + local_block_id * local_conv_stride + local_addr_offset)
+                dst_list.append(remote_conv_addr + remote_block_id * remote_conv_stride + remote_addr_offset)
+                length_list.append(remote_conv_width * conv_dtype_size)
+
+            src_list.append(
+                local_ssm_addr
+                + local_block_id * local_ssm_stride
+                + remote_tp_offset * remote_ssm_len
+            )
+            dst_list.append(remote_ssm_addr + remote_block_id * remote_ssm_stride)
+            length_list.append(remote_ssm_len)
+            logger.debug(
+                "Mooncake GLM5Next Mamba TP transfer layout: conv_shape=%s ssm_shape=%s "
+                "tp_ratio=%s remote_tp_offset=%s conv_segments=%s conv_segment_bytes=%s "
+                "ssm_segment_bytes=%s",
+                conv_shape,
+                ssm_shape,
+                tp_ratio,
+                remote_tp_offset,
+                conv_rows,
+                remote_conv_width * conv_dtype_size,
+                remote_ssm_len,
+            )
+            return
+
+        linear_key_head_dim = hf_text_config.linear_key_head_dim
+        linear_num_key_heads = hf_text_config.linear_num_key_heads
+        linear_value_head_dim = hf_text_config.linear_value_head_dim
+        linear_num_value_heads = hf_text_config.linear_num_value_heads
         remote_num_key_heads = linear_num_key_heads // remote_tp_size
         remote_num_value_heads = linear_num_value_heads // remote_tp_size
         remote_conv_width = (
@@ -3078,7 +3153,7 @@ class MooncakeConnectorWorker:
             "Mooncake kernel block mapping: request=%s transfer_group=%s logical_group=%s "
             "cache_role=%s local_block_size=%s remote_block_size=%s kernel_size=%s "
             "local_scale=%s remote_scale=%s prefix_kernel_offset=%s local_ids=%s remote_ids=%s",
-            meta.remote_request_id,
+            getattr(meta, "remote_request_id", "<unknown>"),
             group_idx,
             kv_cache_group_id,
             group_spec.get("cache_role", "kv"),
@@ -3933,8 +4008,8 @@ class MooncakeConnectorWorker:
                     "local_block_counts=%s remote_block_counts=%s local_block_samples=%s remote_block_samples=%s",
                     req_id,
                     meta.remote_engine_id,
-                    self.kv_cache_group_block_sizes,
-                    meta.remote_block_sizes,
+                    getattr(self, "kv_cache_group_block_sizes", ()),
+                    getattr(meta, "remote_block_sizes", ()),
                     meta.remote_block_size,
                     [len(ids) for ids in meta.local_block_ids],
                     [len(ids) for ids in meta.remote_block_ids],

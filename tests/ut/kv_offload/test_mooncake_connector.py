@@ -590,6 +590,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
                 )
             ]
         )
+        worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(worker.kv_cache_config)
 
         kv_group2layeridx = worker._build_kv_group2layeridx()
 
@@ -632,6 +633,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
                 )
             ]
         )
+        worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(worker.kv_cache_config)
 
         kv_group2layeridx = worker._build_kv_group2layeridx()
 
@@ -1304,6 +1306,62 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(src_list, [0x1000 + 2 * 128, 0x2000 + 2 * 256])
         self.assertEqual(dst_list, [0x3000 + 3 * 160, 0x4000 + 3 * 512])
         self.assertEqual(length_list, [100, 200])
+
+    def test_append_glm5next_mamba_transfer_meta_uses_per_layer_shapes(self):
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+        self.thread.vllm_config.model_config.hf_text_config.model_type = "glm5_next_text"
+
+        conv_shape = (3, 12288)
+        ssm_shape = (32, 128, 128)
+        conv_dtype_size = 2
+        ssm_dtype_size = 4
+        local_conv_len = conv_dtype_size * 3 * 12288
+        local_ssm_len = ssm_dtype_size * 32 * 128 * 128
+        remote_conv_len = local_conv_len // 2
+        remote_ssm_len = local_ssm_len // 2
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [conv_shape, ssm_shape],
+                "dtype_sizes": [conv_dtype_size, ssm_dtype_size],
+            },
+            src_layer_base_addr=[0x10000000, 0x20000000],
+            dst_layer_base_addr=[0x30000000, 0x40000000],
+            block_len=[local_conv_len, local_ssm_len],
+            block_stride=[local_conv_len + 128, local_ssm_len + 256],
+            remote_block_stride=[remote_conv_len + 64, remote_ssm_len + 128],
+            remote_block_id=3,
+            local_block_id=2,
+            tp_num_need_pulls=2,
+            remote_tp_offset=1,
+        )
+
+        local_conv_base = 0x10000000 + 2 * (local_conv_len + 128)
+        remote_conv_base = 0x30000000 + 3 * (remote_conv_len + 64)
+        expected_src = [
+            local_conv_base + (row * 12288 + 6144) * conv_dtype_size
+            for row in range(3)
+        ]
+        expected_dst = [
+            remote_conv_base + row * 6144 * conv_dtype_size for row in range(3)
+        ]
+        expected_src.append(
+            0x20000000 + 2 * (local_ssm_len + 256) + remote_ssm_len
+        )
+        expected_dst.append(0x40000000 + 3 * (remote_ssm_len + 128))
+
+        self.assertEqual(src_list, expected_src)
+        self.assertEqual(dst_list, expected_dst)
+        self.assertEqual(
+            length_list,
+            [6144 * conv_dtype_size] * 3 + [remote_ssm_len],
+        )
 
     def test_transfer_kv_cache_failure(self):
         self.engine.batch_transfer_sync_read.return_value = -1
@@ -2652,6 +2710,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 worker.tp_size = 2
                 worker.tp_rank = dcp_rank
                 worker.block_size = 32
+                worker.kv_cache_group_block_sizes = (32,)
                 worker.num_key_value_heads = 1
                 worker._prefill_tp_size = 4
                 worker.local_remote_block_port_mapping = {}
