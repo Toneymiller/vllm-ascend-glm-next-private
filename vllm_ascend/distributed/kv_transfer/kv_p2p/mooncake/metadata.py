@@ -1,0 +1,189 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+"""Metadata types for Mooncake KV transfer connectors."""
+
+from dataclasses import dataclass
+from typing import Any
+
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+    KVConnectorMetadata,
+)
+
+
+@dataclass(frozen=True)
+class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
+    """Worker transfer information exchanged during the P/D handshake.
+
+    Per-spec fields use the flattened KV-cache spec order. All per-layer
+    fields use layer_names order; each nested list preserves that layer's
+    cache tensor order.
+    """
+
+    engine_id: str
+    te_rpc_port: int
+    block_size: int
+    num_blocks: int
+    spec_block_sizes: list[int]
+    layer_names: list[str]
+    group_indices: list[int]
+    spec_indices: list[int]
+    cache_roles: list[str]
+    transfer_unit_tokens: list[int]
+    kv_caches_base_addr: list[list[int]]
+    block_strides: list[list[int]]
+    block_lens: list[list[int]]
+    block_shapes: list[list[tuple[int, ...]]]
+    block_size_scales: list[list[int]]
+    local_ip: str = ""
+    handshake_port: int = 0
+
+    def __post_init__(self) -> None:
+        num_layers = len(self.layer_names)
+        per_layer_fields = {
+            "group_indices": self.group_indices,
+            "spec_indices": self.spec_indices,
+            "cache_roles": self.cache_roles,
+            "transfer_unit_tokens": self.transfer_unit_tokens,
+            "kv_caches_base_addr": self.kv_caches_base_addr,
+            "block_strides": self.block_strides,
+            "block_lens": self.block_lens,
+            "block_shapes": self.block_shapes,
+            "block_size_scales": self.block_size_scales,
+        }
+        for field_name, values in per_layer_fields.items():
+            if len(values) != num_layers:
+                raise ValueError(
+                    f"Mooncake transfer metadata field {field_name!r} has {len(values)} layers, expected {num_layers}."
+                )
+
+        for layer_index, layer_name in enumerate(self.layer_names):
+            spec_index = self.spec_indices[layer_index]
+            if spec_index < 0 or spec_index >= len(self.spec_block_sizes):
+                raise ValueError(
+                    f"Mooncake layer {layer_name!r} has invalid spec index "
+                    f"{spec_index}; num_specs={len(self.spec_block_sizes)}."
+                )
+            if not self.cache_roles[layer_index]:
+                raise ValueError(f"Mooncake layer {layer_name!r} has an empty cache role.")
+            if self.transfer_unit_tokens[layer_index] <= 0:
+                raise ValueError(
+                    f"Mooncake layer {layer_name!r} has invalid transfer unit {self.transfer_unit_tokens[layer_index]}."
+                )
+
+            num_addrs = len(self.kv_caches_base_addr[layer_index])
+            for field_name in (
+                "block_strides",
+                "block_lens",
+                "block_shapes",
+                "block_size_scales",
+            ):
+                values = per_layer_fields[field_name][layer_index]
+                if len(values) != num_addrs:
+                    raise ValueError(
+                        f"Mooncake transfer metadata for layer {layer_name!r} "
+                        f"has {len(values)} {field_name}, expected {num_addrs}."
+                    )
+
+
+@dataclass(frozen=True)
+class MooncakeTPTransferMetadata:
+    """TP-private connection and KV-cache address information."""
+
+    te_rpc_port: int
+    kv_caches_base_addr: list[list[int]]
+    local_ip: str
+    handshake_port: int
+
+
+@dataclass(frozen=True)
+class MooncakePPTransferMetadata:
+    """Metadata shared by all TP workers belonging to one PP rank."""
+
+    block_size: int
+    num_blocks: int
+    spec_block_sizes: list[int]
+    layer_names: list[str]
+    group_indices: list[int]
+    spec_indices: list[int]
+    cache_roles: list[str]
+    transfer_unit_tokens: list[int]
+    block_strides: list[list[int]]
+    block_lens: list[list[int]]
+    block_shapes: list[list[tuple[int, ...]]]
+    block_size_scales: list[list[int]]
+    metadata_by_tp_rank: dict[int, MooncakeTPTransferMetadata]
+
+
+@dataclass(frozen=True)
+class MooncakeTransferMetadataGroups:
+    """PP-grouped worker transfer metadata exposed by one DP scheduler."""
+
+    engine_id: str
+    scheduler_host: str
+    scheduler_port: int
+    pp_size: int
+    pcp_size: int
+    dcp_size: int
+    tp_size: int
+    metadata_by_pp_rank: dict[int, MooncakePPTransferMetadata]
+
+
+@dataclass
+class ReqMeta:
+    """Request metadata required by the initial Mooncake pull path."""
+
+    local_block_ids: BlockIds
+    local_num_prompt_tokens: int
+    num_external_tokens: int
+    num_computed_tokens: int
+    remote_block_ids: BlockIds
+    remote_host: str
+    remote_port: int
+    remote_engine_id: str
+    remote_request_id: str
+    remote_num_prompt_tokens: int
+    local_full_block_ids: BlockIds
+
+
+class MooncakeConnectorMetadata(KVConnectorMetadata):
+    """Scheduler-to-worker metadata for Mooncake KV transfers."""
+
+    def __init__(self) -> None:
+        self.requests: dict[str, ReqMeta] = {}
+        self.requests_to_send: dict[str, float] = {}
+        self.reqs_in_batch: set[str] = set()
+
+    def add_new_req(
+        self,
+        request_id: str,
+        local_block_ids: BlockIds,
+        local_num_prompt_tokens: int,
+        num_external_tokens: int,
+        kv_transfer_params: dict[str, Any],
+        local_full_block_ids: BlockIds | None = None,
+    ) -> None:
+        self.requests[request_id] = ReqMeta(
+            local_block_ids=local_block_ids,
+            local_num_prompt_tokens=local_num_prompt_tokens,
+            num_external_tokens=num_external_tokens,
+            num_computed_tokens=kv_transfer_params.get("num_computed_tokens", 0),
+            remote_block_ids=kv_transfer_params["remote_block_ids"],
+            remote_host=kv_transfer_params["remote_host"],
+            remote_port=kv_transfer_params["remote_port"],
+            remote_engine_id=kv_transfer_params["remote_engine_id"],
+            remote_request_id=kv_transfer_params["remote_request_id"],
+            remote_num_prompt_tokens=kv_transfer_params["remote_num_prompt_tokens"],
+            local_full_block_ids=local_full_block_ids or tuple(),
+        )
+
+
+__all__ = [
+    "MooncakeConnectorMetadata",
+    "MooncakePPTransferMetadata",
+    "MooncakeTPTransferMetadata",
+    "MooncakeTransferMetadata",
+    "MooncakeTransferMetadataGroups",
+    "ReqMeta",
+]
