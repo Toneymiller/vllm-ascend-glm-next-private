@@ -440,7 +440,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             torch.zeros_like(values),
         ).sum(dim=0)
         expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
-        # Avoid aclnnScatterNdUpdateV2 in ACLGraph capture. Padded rows use
+        # Avoid the scatter-nd update API in ACLGraph capture. Padded rows use
         # row zero as a fixed-shape sentinel and it is restored immediately.
         cache_rows[safe_slots] = safe_values
         cache_rows[0].copy_(expected_zero)
@@ -1121,10 +1121,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
         weights: torch.Tensor,
         *,
-        gate_score: torch.Tensor | None = None,
+        wk: torch.Tensor,
+        gate_weight: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
@@ -1132,9 +1134,11 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         return self.forward_native(
             hidden_states,
             q_quant,
-            k,
             weights,
-            gate_score=gate_score,
+            wk=wk,
+            gate_weight=gate_weight,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
             compress_ape=compress_ape,
             index_kpool=index_kpool,
             positions=positions,
@@ -1144,10 +1148,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
         weights: torch.Tensor,
         *,
-        gate_score: torch.Tensor | None = None,
+        wk: torch.Tensor,
+        gate_weight: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
@@ -1155,9 +1161,11 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         return self.forward_ascend(
             hidden_states,
             q_quant,
-            k,
             weights,
-            gate_score=gate_score,
+            wk=wk,
+            gate_weight=gate_weight,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
             compress_ape=compress_ape,
             index_kpool=index_kpool,
             positions=positions,
@@ -1167,16 +1175,17 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
         weights: torch.Tensor,
         *,
-        gate_score: torch.Tensor | None = None,
+        wk: torch.Tensor,
+        gate_weight: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the upstream kpool write/select/expand/tail forward sequence."""
-        del hidden_states
+        """Run the full KeyPool compress and PoolKeyIndexer select sequence."""
         if self.use_fp4_cache:
             raise ValueError("Ascend GLM-5 Indexer uses BF16 Q, not FP4.")
         if isinstance(q_quant, tuple):
@@ -1185,8 +1194,8 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 q_values = q_values * q_scale.unsqueeze(-1).to(q_values.dtype)
         else:
             q_values = q_quant
-        if gate_score is None or compress_ape is None or positions is None:
-            raise ValueError("GLM-5 kpool requires gate_score, compress_ape, and positions.")
+        if compress_ape is None or positions is None:
+            raise ValueError("GLM-5 kpool requires compress_ape and positions.")
 
         context = get_forward_context()
         metadata = context.attn_metadata
@@ -1203,96 +1212,79 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
 
         is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-        # Eager MTP keeps the first-pass buffer length for later draft steps,
-        # while the per-step attention metadata contains only the real query
-        # rows. Do not feed those padded rows into cache/indexer addressing.
-        # Full graphs must retain their captured fixed shape instead.
-        num_tokens = (
-            positions.shape[0]
-            if is_full_graph
-            else min(attn_metadata.num_actual_tokens, positions.shape[0])
+        num_tokens = positions.shape[0] if is_full_graph else min(attn_metadata.num_actual_tokens, positions.shape[0])
+        cum_query_lens = attn_metadata.cum_query_lens
+        cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=cum_query_lens.dtype, device=cum_query_lens.device),
+                cum_query_lens,
+            ]
         )
-        k = k[:num_tokens].reshape(-1, self.head_dim)
-        gate_score = gate_score[:num_tokens].reshape(-1, self.head_dim)
-        current_state = torch.cat([k, gate_score], dim=-1).to(state_cache.dtype)
-        state_slots = state_metadata.slot_mapping[:num_tokens]
-        self._scatter_paged_cache(
+        start_pos = positions[:num_tokens][cu_seqlens[:-1].clamp_max(num_tokens - 1)].to(torch.int32)
+
+        pooled_key = torch.ops.vllm.glm5_next_key_pool(
+            hidden_states[:num_tokens],
+            wk,
+            gate_weight,
+            compress_ape,
             state_cache,
-            state_slots,
-            current_state,
-            state_metadata.block_size,
+            state_metadata.block_table,
+            start_pos,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            cu_seqlens=cu_seqlens,
+            cmp_ratio=index_kpool,
         )
 
         selected = (
-            torch.arange(num_tokens, device=k.device)
+            torch.arange(num_tokens, device=hidden_states.device)
             if is_full_graph
             else (indexer_metadata.slot_mapping[:num_tokens] >= 0).nonzero().flatten()
         )
         if is_full_graph or selected.numel() > 0:
-            token_ids = torch.arange(num_tokens, device=k.device)
+            token_ids = torch.arange(num_tokens, device=hidden_states.device)
             request_ids = torch.bucketize(
                 token_ids,
-                attn_metadata.cum_query_lens,
+                cu_seqlens,
                 right=True,
             ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
-            pool_state = self._gather_compressor_state(
-                state_cache,
-                state_metadata,
-                positions[selected],
-                request_ids[selected],
+            first_pool = torch.div(
+                start_pos,
                 index_kpool,
+                rounding_mode="floor",
             )
-            query_ends = attn_metadata.cum_query_lens
-            query_offsets = torch.cat([torch.zeros_like(query_ends[:1]), query_ends[:-1]])
-            query_lens = query_ends - query_offsets
-            selected_request_ids = request_ids[selected]
-            request_query_starts = attn_metadata.seq_lens[selected_request_ids] - query_lens[selected_request_ids]
-            pool_offsets = torch.arange(
-                index_kpool - 1,
-                -1,
-                -1,
-                device=k.device,
+            pool_idx = torch.div(
+                positions[:num_tokens][selected],
+                index_kpool,
+                rounding_mode="floor",
             )
-            pool_positions = positions[selected, None] - pool_offsets[None, :]
-            local_positions = pool_positions - request_query_starts[:, None]
-            current_mask = (local_positions >= 0) & (local_positions < query_lens[selected_request_ids, None])
-            current_indices = (
-                (query_offsets[selected_request_ids, None] + local_positions.clamp_min(0))
-                .long()
-                .clamp_max(num_tokens - 1)
-            )
-            current_pool_state = current_state[current_indices]
-            pool_state = torch.where(
-                current_mask.unsqueeze(-1),
-                current_pool_state,
-                pool_state,
-            )
-            pool_k, pool_gate = pool_state.split(self.head_dim, dim=-1)
-            torch.ops.vllm.glm5_next_kpool_compress_and_write_cache(
+            rows = pooled_key[
+                request_ids[selected],
+                (pool_idx - first_pool[request_ids[selected]]).clamp(0, pooled_key.shape[1] - 1),
+            ]
+            self._scatter_paged_cache(
                 indexer_cache,
-                pool_k.to(torch.bfloat16),
-                pool_gate.to(torch.bfloat16),
-                compress_ape,
                 indexer_metadata.slot_mapping[selected].to(torch.int64),
+                rows,
+                indexer_cache.shape[1],
             )
 
-        max_pool_seq_len = (
-            indexer_metadata.block_table.shape[1] * indexer_cache.shape[1]
-            if is_full_graph
-            else int(indexer_metadata.seq_lens_cpu.max())
-        )
-        return torch.ops.vllm.glm5_next_lightning_indexer(
+        indices, _ = torch.ops.vllm.glm5_next_pool_key_indexer(
             q_values[:num_tokens],
             indexer_cache,
             weights[:num_tokens].to(q_values.dtype),
-            attn_metadata.cum_query_lens,
-            indexer_metadata.seq_lens,
-            indexer_metadata.block_table,
-            positions[:num_tokens],
-            index_topk=self.topk_tokens,
-            index_kpool=index_kpool,
-            max_pool_seq_len=max_pool_seq_len,
+            (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
+            actual_seq_q=cum_query_lens,
+            actual_seq_k=indexer_metadata.seq_lens,
+            block_table=indexer_metadata.block_table,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            topk=self.topk_tokens,
+            pool_size=index_kpool,
+            mask_mode=3,
+            return_value=False,
         )
+        return indices.unsqueeze(1)
 
 
 class AscendGlm5NextIndexer(nn.Module):
@@ -1400,9 +1392,7 @@ class AscendGlm5NextIndexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
-        k = self.k_norm(k)
 
         if self.rope_dim > 0:
             if rotary_emb is None:
@@ -1412,36 +1402,26 @@ class AscendGlm5NextIndexer(nn.Module):
                 [self.rope_dim, self.head_dim - self.rope_dim],
                 dim=-1,
             )
-            k_pe, k_nope = torch.split(
-                k,
-                [self.rope_dim, self.head_dim - self.rope_dim],
-                dim=-1,
-            )
-            q_pe, k_pe = rotary_emb(
+            q_pe, _ = rotary_emb(
                 positions,
                 q_pe,
-                k_pe.unsqueeze(1),
+                q_pe.unsqueeze(1),
             )
             q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
-            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
         q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
 
         # Upstream folds the FP8 Q scale into weights. Q remains BF16 on
         # Ascend, so only the model-level factors are required.
         weights = weights * (self.softmax_scale * self.n_head**-0.5)
-        gate_score = torch.nn.functional.linear(
-            hidden_states,
-            self.index_kpool_compress_gate,
-        )
         return self.indexer_op(
             hidden_states,
             q,
-            k,
             weights,
-            gate_score=gate_score,
+            wk=self.wk_weights_proj.weight[: self.head_dim],
+            gate_weight=self.index_kpool_compress_gate,
+            norm_weight=self.k_norm.weight,
+            norm_bias=self.k_norm.bias,
             compress_ape=self.index_kpool_compress_ape,
             index_kpool=self.index_kpool,
             positions=positions,
