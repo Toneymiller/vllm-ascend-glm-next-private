@@ -172,3 +172,104 @@ def test_glm_next_indexer_state_keeps_original_group_block_ids():
     )
 
     assert transfers == [(0, [6, 7], [4, 5])]
+
+
+def test_mtp_indexer_state_drops_only_remote_speculative_tail():
+    _, _, _, _, _, state_spec = _build_glm_next_worker(2176)
+    thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
+    thread.dcp_size = 1
+    thread.num_speculative_tokens = 2
+
+    transfers = thread._compute_group_block_ids(
+        request_id="glm-next-mtp-state",
+        remote_tp_rank_groups=[[0]],
+        remote_dcp_size=1,
+        spec_index=3,
+        local_block_size=4,
+        remote_block_size=4,
+        local_group_block_ids=[60, 61],
+        local_full_group_block_ids=[50, 60, 61],
+        remote_group_block_ids=[40, 41, 42, 43],
+        local_num_prompt_tokens=1024,
+        remote_num_prompt_tokens=1024,
+        num_computed_tokens=0,
+        local_block_size_scale=1,
+        remote_block_size_scale=1,
+        spec=state_spec,
+        selection_index=0,
+        local_transfer_unit_tokens=4,
+        remote_transfer_unit_tokens=4,
+        cache_role="indexer_state",
+    )
+
+    assert transfers == [(0, [60, 61], [41, 42])]
+
+
+def test_mtp_indexer_state_preserves_local_and_remote_group_ids():
+    _, _, _, _, _, state_spec = _build_glm_next_worker(2176)
+    thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
+    thread.spec_indices = [0]
+    thread.kv_cache_specs = [state_spec]
+    thread.layer_names = ["model.layers.61.self_attn.indexer.compressor.state_cache"]
+    thread.layer_block_sizes = [4]
+    thread.group_indices = [1]
+    thread.cache_roles = ["indexer_state"]
+    thread.transfer_unit_tokens = [4]
+    thread.block_size_scales = [[1]]
+    thread.dcp_size = 1
+    thread.num_speculative_tokens = 2
+
+    remote_metadata = SimpleNamespace(
+        layer_block_sizes=[4],
+        group_indices=[3],
+        cache_roles=["indexer_state"],
+        transfer_unit_tokens=[4],
+        block_size_scales=[[1]],
+    )
+    request = SimpleNamespace(
+        local_block_ids=([], [61]),
+        local_full_block_ids=([], [61]),
+        remote_block_ids=([100], [101], [102], [91, 92]),
+        local_num_prompt_tokens=1024,
+        remote_num_prompt_tokens=1024,
+        num_computed_tokens=0,
+    )
+
+    buckets, _ = thread._build_transfer_block_buckets(
+        remote_metadata=remote_metadata,
+        layer_pairs=[(0, 0)],
+        tp_rank_groups_by_layer={(0, 0): [[0]]},
+        remote_dcp_size=1,
+        requests={"request-mtp": request},
+        transfer_block_ids_by_spec={},
+    )
+
+    assert buckets[0][0][(0, 0)] == [("request-mtp", [61], [91])]
+
+
+def test_target_and_mtp_indexer_states_keep_group_scoped_specs():
+    target_name = "model.layers.3.self_attn.indexer.compressor.state_cache"
+    mtp_name = "model.layers.61.self_attn.indexer.compressor.state_cache"
+    state_spec = AscendIndexerKPoolStateSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+        compress_ratio=1,
+        model_version="glm5_next",
+        cache_role="indexer_state",
+    )
+    worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=[target_name], kv_cache_spec=state_spec),
+            SimpleNamespace(layer_names=[mtp_name], kv_cache_spec=state_spec),
+        ]
+    )
+
+    worker._build_kv_cache_spec_mappings()
+
+    assert worker.layer_name_to_group_index[target_name] == 0
+    assert worker.layer_name_to_group_index[mtp_name] == 1
+    assert worker.layer_name_to_spec_index[target_name] != worker.layer_name_to_spec_index[mtp_name]

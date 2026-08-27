@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 """Metadata types for Mooncake KV transfer connectors."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,19 +17,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
     """Worker transfer information exchanged during the P/D handshake.
 
-    Per-spec fields use the flattened KV-cache spec order. All per-layer
-    fields use layer_names order; each nested list preserves that layer's
-    cache tensor order.
+    All per-layer fields use layer_names order; each nested list preserves
+    that layer's cache tensor order.
     """
 
     engine_id: str
     te_rpc_port: int
     block_size: int
     num_blocks: int
-    spec_block_sizes: list[int]
     layer_names: list[str]
+    layer_block_sizes: list[int]
     group_indices: list[int]
-    spec_indices: list[int]
     cache_roles: list[str]
     transfer_unit_tokens: list[int]
     kv_caches_base_addr: list[list[int]]
@@ -41,30 +40,30 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
 
     def __post_init__(self) -> None:
         num_layers = len(self.layer_names)
-        per_layer_fields = {
-            "group_indices": self.group_indices,
-            "spec_indices": self.spec_indices,
-            "cache_roles": self.cache_roles,
-            "transfer_unit_tokens": self.transfer_unit_tokens,
-            "kv_caches_base_addr": self.kv_caches_base_addr,
-            "block_strides": self.block_strides,
-            "block_lens": self.block_lens,
-            "block_shapes": self.block_shapes,
-            "block_size_scales": self.block_size_scales,
-        }
-        for field_name, values in per_layer_fields.items():
+        per_layer_fields: tuple[tuple[str, Sequence[object]], ...] = (
+            ("layer_block_sizes", self.layer_block_sizes),
+            ("group_indices", self.group_indices),
+            ("cache_roles", self.cache_roles),
+            ("transfer_unit_tokens", self.transfer_unit_tokens),
+            ("kv_caches_base_addr", self.kv_caches_base_addr),
+            ("block_strides", self.block_strides),
+            ("block_lens", self.block_lens),
+            ("block_shapes", self.block_shapes),
+            ("block_size_scales", self.block_size_scales),
+        )
+        for field_name, values in per_layer_fields:
             if len(values) != num_layers:
                 raise ValueError(
                     f"Mooncake transfer metadata field {field_name!r} has {len(values)} layers, expected {num_layers}."
                 )
 
+        nested_per_layer_fields: tuple[tuple[str, Sequence[Sequence[object]]], ...] = (
+            ("block_strides", self.block_strides),
+            ("block_lens", self.block_lens),
+            ("block_shapes", self.block_shapes),
+            ("block_size_scales", self.block_size_scales),
+        )
         for layer_index, layer_name in enumerate(self.layer_names):
-            spec_index = self.spec_indices[layer_index]
-            if spec_index < 0 or spec_index >= len(self.spec_block_sizes):
-                raise ValueError(
-                    f"Mooncake layer {layer_name!r} has invalid spec index "
-                    f"{spec_index}; num_specs={len(self.spec_block_sizes)}."
-                )
             if not self.cache_roles[layer_index]:
                 raise ValueError(f"Mooncake layer {layer_name!r} has an empty cache role.")
             if self.transfer_unit_tokens[layer_index] <= 0:
@@ -73,13 +72,8 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
                 )
 
             num_addrs = len(self.kv_caches_base_addr[layer_index])
-            for field_name in (
-                "block_strides",
-                "block_lens",
-                "block_shapes",
-                "block_size_scales",
-            ):
-                values = per_layer_fields[field_name][layer_index]
+            for field_name, per_layer_values in nested_per_layer_fields:
+                values = per_layer_values[layer_index]
                 if len(values) != num_addrs:
                     raise ValueError(
                         f"Mooncake transfer metadata for layer {layer_name!r} "
@@ -92,6 +86,10 @@ class MooncakeTPTransferMetadata:
     """TP-private connection and KV-cache address information."""
 
     te_rpc_port: int
+    # PP-union layer indices physically owned by this TP rank. The address
+    # table remains aligned with the PP-union layer order; unowned entries are
+    # empty lists.
+    layer_indices: list[int]
     kv_caches_base_addr: list[list[int]]
     local_ip: str
     handshake_port: int
@@ -103,10 +101,9 @@ class MooncakePPTransferMetadata:
 
     block_size: int
     num_blocks: int
-    spec_block_sizes: list[int]
     layer_names: list[str]
+    layer_block_sizes: list[int]
     group_indices: list[int]
-    spec_indices: list[int]
     cache_roles: list[str]
     transfer_unit_tokens: list[int]
     block_strides: list[list[int]]
@@ -127,6 +124,7 @@ class MooncakeTransferMetadataGroups:
     pcp_size: int
     dcp_size: int
     tp_size: int
+    use_kv_pp: bool
     metadata_by_pp_rank: dict[int, MooncakePPTransferMetadata]
 
 
