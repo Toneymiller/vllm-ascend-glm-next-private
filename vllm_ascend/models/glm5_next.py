@@ -2,6 +2,7 @@ from collections.abc import Iterable
 from typing import ClassVar
 
 import torch
+import torch_npu
 from einops import rearrange
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
@@ -1222,7 +1223,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         )
         start_pos = positions[:num_tokens][cu_seqlens[:-1].clamp_max(num_tokens - 1)].to(torch.int32)
 
-        pooled_key = torch.ops.vllm.glm5_next_key_pool(
+        pooled_key = torch_npu.key_pool(
             hidden_states[:num_tokens],
             wk,
             gate_weight,
@@ -1269,7 +1270,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 indexer_cache.shape[1],
             )
 
-        indices, _ = torch.ops.vllm.glm5_next_pool_key_indexer(
+        indices, _ = torch_npu.pool_key_indexer(
             q_values[:num_tokens],
             indexer_cache,
             weights[:num_tokens].to(q_values.dtype),

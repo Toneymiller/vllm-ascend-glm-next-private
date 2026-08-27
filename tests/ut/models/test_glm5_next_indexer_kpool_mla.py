@@ -48,8 +48,6 @@ from vllm_ascend.models.glm5_next import (
     AscendGlm5NextIndexerKPoolCache,
     AscendSparseAttnIndexerKpool,
 )
-from vllm_ascend.ops.glm5_next_key_pool import glm5_next_key_pool
-from vllm_ascend.ops.glm5_next_pool_key_indexer import glm5_next_pool_key_indexer
 from vllm_ascend.ops.indexer_kpool_mla import (
     AscendIndexerKPoolMLAAttention,
     IndexerKPoolMLACacheLayer,
@@ -1316,8 +1314,8 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch.ops.vllm.glm5_next_pool_key_indexer", create=True)
-@patch("torch.ops.vllm.glm5_next_key_pool", create=True)
+@patch("torch_npu.pool_key_indexer", create=True)
+@patch("torch_npu.key_pool", create=True)
 def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
     mock_key_pool,
     mock_pool_key_indexer,
@@ -1396,7 +1394,7 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch.ops.vllm.glm5_next_pool_key_indexer", create=True)
+@patch("torch_npu.pool_key_indexer", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_scatter,
@@ -1680,133 +1678,6 @@ def test_indexer_kpool_mla_indexer_kpool_topk_pads_when_history_is_short():
     assert result[result >= 0].tolist() == [0]
 
 
-def test_glm5_next_pool_key_indexer_matches_golden_semantics():
-    index_topk = 4
-    index_kpool = 2
-    logical_keys = torch.tensor(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [-1.0, 2.0],
-            [3.0, -1.0],
-        ],
-        dtype=torch.bfloat16,
-    )
-    indexer_cache = torch.zeros((3, 2, 1, 2), dtype=torch.bfloat16)
-    indexer_block_table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
-    for pool_id, logical_key in enumerate(logical_keys):
-        logical_page, offset = divmod(pool_id, 2)
-        physical_page = int(indexer_block_table[0, logical_page])
-        indexer_cache[physical_page, offset, 0] = logical_key
-    indexer_cache_before = indexer_cache.clone()
-
-    query = torch.tensor(
-        [
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 1.0], [2.0, 0.0]],
-        ],
-        dtype=torch.bfloat16,
-    )
-    weights = torch.tensor(
-        [
-            [1.0, 2.0],
-            [1.0, -1.0],
-        ],
-        dtype=torch.bfloat16,
-    )
-    pool_tail_k = torch.tensor([1], dtype=torch.int32)
-    actual_seq_q = torch.tensor([2], dtype=torch.int32)
-    actual_seq_k = torch.tensor([5], dtype=torch.int32)
-
-    indices, values = glm5_next_pool_key_indexer(
-        query,
-        indexer_cache,
-        weights,
-        pool_tail_k,
-        actual_seq_q=actual_seq_q,
-        actual_seq_k=actual_seq_k,
-        block_table=indexer_block_table,
-        layout_q="TND",
-        layout_k="PA_BBND",
-        topk=index_topk,
-        pool_size=index_kpool,
-        mask_mode=3,
-        return_value=True,
-    )
-
-    assert indices.dtype == torch.int32
-    assert indices.shape == (2, index_topk + index_kpool - 1)
-    assert values.shape == (2, index_topk // index_kpool)
-    # Golden semantics (pool_key_indexer_reference.py): scaled ReLU scores,
-    # pool-level top-k with stable tie-breaking, expansion and causal tail.
-    torch.testing.assert_close(
-        indices,
-        torch.tensor(
-            [
-                [6, 7, 4, 5, 10],
-                [2, 3, 6, 7, 10],
-            ],
-            dtype=torch.int32,
-        ),
-    )
-    torch.testing.assert_close(
-        values,
-        torch.tensor(
-            [
-                [2.82842712, 2.12132034],
-                [0.70710678, 0.70710678],
-            ],
-            dtype=torch.float32,
-        ),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    torch.testing.assert_close(indexer_cache, indexer_cache_before)
-
-
-def test_glm5_next_pool_key_indexer_pads_output_to_query_rows():
-    index_topk = 2
-    index_kpool = 2
-    head_dim = 2
-    indexer_cache = torch.zeros((1, 2, 1, head_dim), dtype=torch.bfloat16)
-    indexer_cache[0, 0, 0, 0] = 1.0
-    indexer_block_table = torch.tensor([[0]], dtype=torch.int32)
-
-    query = torch.tensor(
-        [
-            [[1.0, 0.0]],
-            [[9.0, 9.0]],  # CUDA-graph padding row
-        ],
-        dtype=torch.bfloat16,
-    )
-    weights = torch.ones((2, 1), dtype=torch.bfloat16)
-    pool_tail_k = torch.tensor([0], dtype=torch.int32)
-    actual_seq_q = torch.tensor([1], dtype=torch.int32)
-    actual_seq_k = torch.tensor([1], dtype=torch.int32)
-
-    indices, values = glm5_next_pool_key_indexer(
-        query,
-        indexer_cache,
-        weights,
-        pool_tail_k,
-        actual_seq_q=actual_seq_q,
-        actual_seq_k=actual_seq_k,
-        block_table=indexer_block_table,
-        layout_q="TND",
-        layout_k="PA_BBND",
-        topk=index_topk,
-        pool_size=index_kpool,
-        mask_mode=3,
-        return_value=False,
-    )
-
-    assert indices.shape == (2, index_topk + index_kpool - 1)
-    assert indices[0].tolist() == [0, 1, -1]
-    assert indices[1].tolist() == [-1, -1, -1]
-    assert values.shape == (0,)
-
-
 def test_indexer_kpool_mla_kpool_compress_returns_bfloat16_without_quant_scale():
     indexer_cache = torch.zeros((1, 2, 1, 2), dtype=torch.bfloat16)
     slot_k = torch.tensor(
@@ -1833,59 +1704,6 @@ def test_indexer_kpool_mla_kpool_compress_returns_bfloat16_without_quant_scale()
     torch.testing.assert_close(
         compressed_k,
         torch.tensor([[2.0, 2.0]], dtype=torch.bfloat16),
-    )
-
-
-def test_glm5_next_key_pool_matches_golden_pooling_semantics():
-    hidden_states = torch.tensor(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [2.0, 0.0],
-            [0.0, 2.0],
-        ],
-        dtype=torch.bfloat16,
-    )
-    wk = torch.eye(2, dtype=torch.bfloat16)
-    gate_weight = torch.zeros((2, 2), dtype=torch.bfloat16)
-    ape = torch.zeros((2, 2), dtype=torch.float32)
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
-    cache_block_table = torch.tensor([[0, 0], [0, 0]], dtype=torch.int32)
-    start_pos = torch.tensor([0, 2], dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-
-    pooled_key = glm5_next_key_pool(
-        hidden_states,
-        wk,
-        gate_weight,
-        ape,
-        state_cache,
-        cache_block_table,
-        start_pos,
-        cu_seqlens=cu_seqlens,
-        cmp_ratio=2,
-    )
-
-    assert pooled_key.shape == (2, 4, 2)
-    # Batch 0: pool 0 = mean of keys [1,0] and [0,1] (uniform softmax).
-    torch.testing.assert_close(
-        pooled_key[0, 0],
-        torch.tensor([0.5, 0.5], dtype=torch.bfloat16),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    # Batch 1: pool 1 = mean of keys [1,1] and [2,0].
-    torch.testing.assert_close(
-        pooled_key[1, 0],
-        torch.tensor([1.5, 0.5], dtype=torch.bfloat16),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    # Tail cache: batch 1's incomplete pool row (position 4) holds [K, gate].
-    torch.testing.assert_close(
-        state_cache[0, 0],
-        torch.tensor([0.0, 2.0, 0.0, 0.0], dtype=torch.bfloat16),
     )
 
 
