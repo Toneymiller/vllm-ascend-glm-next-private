@@ -36,6 +36,42 @@ from vllm_ascend.device.device_op import DeviceOperator
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE = 1024
 GLM5_SFA_KERNEL_BLOCK_SIZE = 128
+INDEXER_KPOOL_MAX_BLOCK_SIZE = 1024
+INDEXER_KPOOL_BLOCK_ALIGNMENT = 16
+
+
+def select_indexer_block_size(storage_block_size: int) -> tuple[int, int]:
+    """Select a CANN-compatible physical block size for the indexer cache.
+
+    ``pool_key_indexer`` requires the ``PA_BBND`` block dimension to be a
+    multiple of 16 and no larger than 1024.  GLM-5's logical attention block
+    can be much larger than 1024 after compression, so split one storage block
+    into several CANN-compatible sub-blocks when necessary.
+
+    Returns ``(block_size, blocks_per_logical_block)``.
+    """
+    if storage_block_size <= 0:
+        raise ValueError(
+            f"Indexer KPool storage block size must be positive, got {storage_block_size}."
+        )
+    if (
+        storage_block_size <= INDEXER_KPOOL_MAX_BLOCK_SIZE
+        and storage_block_size % INDEXER_KPOOL_BLOCK_ALIGNMENT == 0
+    ):
+        return storage_block_size, 1
+    for candidate in range(
+        min(storage_block_size, INDEXER_KPOOL_MAX_BLOCK_SIZE),
+        INDEXER_KPOOL_BLOCK_ALIGNMENT - 1,
+        -INDEXER_KPOOL_BLOCK_ALIGNMENT,
+    ):
+        if storage_block_size % candidate == 0:
+            return candidate, storage_block_size // candidate
+    raise ValueError(
+        "Indexer KPool storage block size "
+        f"{storage_block_size} cannot be split into a block size that is a "
+        f"multiple of {INDEXER_KPOOL_BLOCK_ALIGNMENT} and no larger than "
+        f"{INDEXER_KPOOL_MAX_BLOCK_SIZE}."
+    )
 
 
 @dataclass
@@ -108,6 +144,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         self.kernel_blocks_per_logical_block = (
             self.logical_block_size // GLM5_SFA_KERNEL_BLOCK_SIZE
         )
+        self.indexer_block_size, self.indexer_blocks_per_logical_block = (
+            select_indexer_block_size(self.storage_block_size)
+        )
         scheduler_config = vllm_config.scheduler_config
         # ACLGraph replay keeps the addresses captured on the first run. The
         # derived compressed metadata therefore needs persistent storage that
@@ -128,7 +167,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         )
         self._block_table_buffer = torch.empty(
             scheduler_config.max_num_seqs,
-            max_logical_blocks,
+            max_logical_blocks * self.indexer_blocks_per_logical_block,
             dtype=torch.int32,
             device=device,
         )
@@ -180,32 +219,50 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
                 f"table: width={expanded_block_table.shape[1]}, split={split}."
             )
         logical_width = expanded_block_table.shape[1] // split
-        if logical_width > self._block_table_buffer.shape[1]:
+        expanded_width = logical_width * self.indexer_blocks_per_logical_block
+        if expanded_width > self._block_table_buffer.shape[1]:
             raise ValueError(
                 "GLM-5 indexer block table exceeds its persistent buffer: "
-                f"required={logical_width}, capacity="
+                f"required={expanded_width}, capacity="
                 f"{self._block_table_buffer.shape[1]}."
             )
         block_table = self._block_table_buffer[
-            :num_reqs, :logical_width
+            :num_reqs, :expanded_width
         ]
         # The common full-group table is expanded for the C128 SFA kernel:
         # scheduler block N becomes [split*N, ..., split*N+split-1]. The
         # compressed indexer owns one physical page per scheduler block, so it
         # must recover N rather than treating the SFA sub-blocks as pages.
-        torch.div(
+        base = torch.div(
             expanded_block_table[:, ::split],
             split,
             rounding_mode="floor",
-            out=block_table,
         )
+        k = self.indexer_blocks_per_logical_block
+        if k == 1:
+            block_table.copy_(base)
+        else:
+            base_repeated = base.repeat_interleave(k, dim=1)
+            offsets = torch.arange(
+                expanded_width,
+                dtype=torch.int32,
+                device=base.device,
+            ) % k
+            valid = base_repeated >= 0
+            block_table.copy_(
+                torch.where(
+                    valid,
+                    base_repeated * k + offsets,
+                    torch.full_like(base_repeated, -1),
+                )
+            )
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
-            block_size=self.storage_block_size,
+            block_size=self.indexer_block_size,
             compress_ratio=self.compress_ratio,
         )
 
@@ -219,7 +276,9 @@ class AscendIndexerKPoolBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # 调度器仍按逻辑 token block 管理；物理 cache 使用 storage_block_size。
+        # The scheduler manages logical token blocks; the physical cache uses
+        # storage_block_size, split into CANN-compatible sub-blocks when passed
+        # to pool_key_indexer.
         return [MultipleOf(1)]
 
     @staticmethod
@@ -675,7 +734,8 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
         # The SFA base stores this tensor before post-processing.  Make that
         # write initialize one complete compressor-state row: [K, empty gate].
-        state_k = k_li.to(torch.bfloat16).view(-1, self.head_dim).unsqueeze(1)
+        # CANN key_pool requires the state cache to be FP32.
+        state_k = k_li.to(torch.float32).view(-1, self.head_dim).unsqueeze(1)
         return torch.cat([state_k, torch.zeros_like(state_k)], dim=-1), None
 
     def exec_kv(
