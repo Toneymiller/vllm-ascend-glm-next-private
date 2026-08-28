@@ -57,6 +57,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
@@ -907,13 +908,10 @@ class KVCacheRecvingThread(threading.Thread):
             )
             if not has_group_blocks and (is_state_group or not has_replicate_k_blocks):
                 continue
-            if is_state_group:
-                # State caches contain the current recurrent/tail state rather than
-                # context blocks. P and D may therefore own a different number of
-                # logical state blocks. Transfer only the latest valid P-side state
-                # into D's active state block. Mamba keeps its first-block convention
-                # and dedicated multi-tensor layout; indexer_state selects the latest
-                # D-side tail page and uses the regular single-tensor address path.
+            if is_mamba_group:
+                # Mamba keeps one recurrent state per speculative step. Select
+                # the last committed state and retain its dedicated multi-tensor
+                # transfer layout.
                 transfer_block_idx = len(remote_group_block_ids) - self.num_speculative_tokens - 1
                 if transfer_block_idx < 0:
                     raise RuntimeError(
@@ -925,10 +923,8 @@ class KVCacheRecvingThread(threading.Thread):
                         f"num_speculative_tokens={self.num_speculative_tokens}"
                     )
                 grouped_remote_block_ids = [[remote_group_block_ids[transfer_block_idx]]]
-                local_state_block_id = local_group_block_ids[0] if is_mamba_group else local_group_block_ids[-1]
-                grouped_local_block_ids = [[local_state_block_id]]
-                state_selection_log = logger.debug if is_mamba_group else logger.info
-                state_selection_log(
+                grouped_local_block_ids = [[local_group_block_ids[0]]]
+                logger.debug(
                     "Mooncake state transfer selection: request_id=%s group_idx=%s "
                     "kv_cache_group_id=%s cache_role=%s spec_type=%s "
                     "local_block_count=%s remote_block_count=%s selected_local_block_id=%s "
@@ -946,6 +942,10 @@ class KVCacheRecvingThread(threading.Thread):
                     inner_offset,
                     session_id,
                 )
+            elif group_spec.get("cache_role") == "indexer_state":
+                # The worker already selected the unfinished pool page.
+                grouped_local_block_ids = [[local_group_block_ids[0]]]
+                grouped_remote_block_ids = [[remote_group_block_ids[0]]]
             else:
                 grouped_remote_block_ids: list[list[int]] = []
                 grouped_local_block_ids: list[list[int]] = []
@@ -3091,6 +3091,58 @@ class MooncakeConnectorWorker:
             "indexer_state",
         )
 
+    def _get_indexer_state_block_ids(
+        self,
+        meta: ReqMeta,
+        group_idx: int,
+        group_spec: dict[str, Any],
+    ) -> tuple[list[int], list[int]]:
+        """Select the unfinished GLM indexer-pool page."""
+        layer_name = group_spec["layer_names"][0]
+        layer_spec = self._get_layer_spec(layer_name)
+        if not isinstance(layer_spec, AscendIndexerKPoolStateSpec):
+            raise RuntimeError(f"Unexpected indexer-state spec for {layer_name}: {type(layer_spec).__name__}")
+
+        token_count = meta.num_computed_tokens + meta.num_external_tokens
+        block_size = layer_spec.block_size
+        tail_tokens = token_count % block_size
+        if tail_tokens == 0:
+            return [], []
+
+        kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
+        page_idx = (token_count - 1) // block_size
+        local_full_block_ids = meta.local_full_block_ids
+        if (
+            not local_full_block_ids
+            or kv_cache_group_id >= len(meta.remote_block_ids)
+            or kv_cache_group_id >= len(local_full_block_ids)
+            or page_idx >= len(meta.remote_block_ids[kv_cache_group_id])
+            or page_idx >= len(local_full_block_ids[kv_cache_group_id])
+        ):
+            raise RuntimeError(
+                "Mooncake indexer-state page is outside the P/D block tables: "
+                f"request_id={meta.remote_request_id}, group_idx={group_idx}, "
+                f"kv_cache_group_id={kv_cache_group_id}, page_idx={page_idx}"
+            )
+
+        remote_block_id = meta.remote_block_ids[kv_cache_group_id][page_idx]
+        local_block_id = local_full_block_ids[kv_cache_group_id][page_idx]
+        logger.info(
+            "Mooncake indexer-state selection: request_id=%s group_idx=%s "
+            "kv_cache_group_id=%s token_count=%s block_size=%s tail_tokens=%s "
+            "page_idx=%s local_block_id=%s remote_block_id=%s",
+            meta.remote_request_id,
+            group_idx,
+            kv_cache_group_id,
+            token_count,
+            block_size,
+            tail_tokens,
+            page_idx,
+            local_block_id,
+            remote_block_id,
+        )
+        return [local_block_id], [remote_block_id]
+
     def _get_local_group_block_size(self, group_idx: int, group_spec: dict[str, Any]) -> int:
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
         if kv_cache_group_id < len(self.kv_cache_group_block_sizes):
@@ -3113,12 +3165,16 @@ class MooncakeConnectorWorker:
         """No-CP per-group block ids at kernel granularity: (local, remote).
 
         Mamba state is not block-sharded, so its logical ids pass through unchanged.
-        Attention expands both sides to kernel blocks, skips the prefix-cached remote
-        kernels (already on D, located via num_computed_tokens), and trims both lists
-        to the shorter one so remote/local stay aligned.
+        GLM indexer state selects its unfinished logical pool page from the real
+        per-layer spec. Attention expands both sides to kernel blocks, skips the
+        prefix-cached remote kernels (already on D, located via
+        num_computed_tokens), and trims both lists to the shorter one so
+        remote/local stay aligned.
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
-        if self._is_state_transfer_group(group_spec):
+        if group_spec.get("cache_role") == "indexer_state":
+            return self._get_indexer_state_block_ids(meta, group_idx, group_spec)
+        if group_spec.get("kv_cache_spec_type") == "MambaSpec":
             return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
 
         local_block_size = self._get_local_group_block_size(group_idx, group_spec)
@@ -3604,9 +3660,23 @@ class MooncakeConnectorWorker:
             for group_idx, (group_spec, _) in kv_group_items:
                 kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
                 block_id_idx = group_idx if use_transfer_group_block_ids else kv_cache_group_id
+                if group_spec.get("cache_role") == "indexer_state":
+                    # Indexer state is not context-block sharded. Select its
+                    # unfinished absolute pool page once on the final CP shard.
+                    if is_final_shard:
+                        selected_local, selected_remote = self._get_indexer_state_block_ids(
+                            meta,
+                            group_idx,
+                            group_spec,
+                        )
+                    else:
+                        selected_local, selected_remote = [], []
+                    group_local_block_ids[block_id_idx] = selected_local
+                    group_remote_block_ids[block_id_idx] = selected_remote
+                    continue
                 if self._is_state_transfer_group(group_spec):
-                    # State groups are not context-block sharded like attention
-                    # KV. Transfer the final state from the final PCP/DCP shard.
+                    # Mamba state is not context-block sharded like attention
+                    # KV. Transfer it from the final PCP/DCP shard.
                     group_remote_block_ids[block_id_idx] = (
                         list(meta.remote_block_ids[kv_cache_group_id]) if is_final_shard else []
                     )

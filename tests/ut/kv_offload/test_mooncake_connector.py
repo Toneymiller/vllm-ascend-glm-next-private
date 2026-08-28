@@ -447,22 +447,55 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         self.assertEqual(local_ids, list(range(34, 42)))
         self.assertEqual(remote_ids, list(range(10, 18)))
 
-    def test_indexer_state_block_ids_pass_through_original_group(self):
-        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
-        group_spec = {
-            "kv_cache_spec_type": "AscendIndexerKPoolStateSpec",
-            "kv_cache_group_id": 1,
-            "cache_role": "indexer_state",
-        }
+    def test_indexer_state_block_ids_select_committed_tail_with_mtp(self):
+        worker, _, _, _ = self._build_glm5next_worker()
+        worker.num_speculative_tokens = 3
+        worker.kv_group2layeridx = worker._build_kv_group2layeridx()
+        group_idx = 2
+        group_spec, layer_indices = worker.kv_group2layeridx[group_idx]
         meta = types.SimpleNamespace(
             local_block_ids=([2], [6, 7]),
-            remote_block_ids=([1], [4, 5]),
+            local_full_block_ids=([2], [0, 8, 9]),
+            remote_block_ids=([1], [0, 3, 4]),
+            num_computed_tokens=4,
+            num_external_tokens=6,
+            remote_request_id="glm-indexer-state-mtp3",
         )
 
-        local_ids, remote_ids = worker._get_kernel_block_ids([138], cast(ReqMeta, meta), 2, group_spec)
+        local_ids, remote_ids = worker._get_kernel_block_ids(
+            layer_indices,
+            cast(ReqMeta, meta),
+            group_idx,
+            group_spec,
+        )
 
-        self.assertEqual(local_ids, [6, 7])
-        self.assertEqual(remote_ids, [4, 5])
+        self.assertEqual(local_ids, [9])
+        self.assertEqual(remote_ids, [4])
+
+    def test_indexer_state_block_ids_skip_completed_pool_boundary(self):
+        worker, _, _, _ = self._build_glm5next_worker()
+        worker.num_speculative_tokens = 3
+        worker.kv_group2layeridx = worker._build_kv_group2layeridx()
+        group_idx = 2
+        group_spec, layer_indices = worker.kv_group2layeridx[group_idx]
+        meta = types.SimpleNamespace(
+            local_block_ids=([2], [6, 7]),
+            local_full_block_ids=([2], [0, 8, 9]),
+            remote_block_ids=([1], [0, 3, 4]),
+            num_computed_tokens=4,
+            num_external_tokens=4,
+            remote_request_id="glm-indexer-state-complete-pool",
+        )
+
+        local_ids, remote_ids = worker._get_kernel_block_ids(
+            layer_indices,
+            cast(ReqMeta, meta),
+            group_idx,
+            group_spec,
+        )
+
+        self.assertEqual(local_ids, [])
+        self.assertEqual(remote_ids, [])
 
     def test_split_transfer_groups_get_independent_ids_and_name_mapping(self):
         local_groups = {
@@ -1150,10 +1183,11 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
-    def test_transfer_indexer_state_selects_latest_remote_block(self, mock_get_meta):
+    def test_transfer_indexer_state_consumes_preselected_blocks_with_mtp(self, mock_get_meta):
         req = dict(self.test_req)
-        req["local_block_ids"] = [[2, 3]]
-        req["remote_block_ids"] = [[7, 8, 9]]
+        req["local_block_ids"] = [[3]]
+        req["remote_block_ids"] = [[9]]
+        self.thread.num_speculative_tokens = 3
         self.thread.kv_group2layeridx = {
             0: (
                 {
