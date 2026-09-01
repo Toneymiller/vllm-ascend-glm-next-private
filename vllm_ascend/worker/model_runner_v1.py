@@ -3510,6 +3510,26 @@ class NPUModelRunner(GPUModelRunner):
             # rows as well so device-side metadata does not see stale block ids.
             self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+            # Uniform-decode dummy runs (e.g. the eager warmup right before
+            # FULL graph capture) must present the same speculative-decode
+            # metadata as the real decode path. Without it, GDN/KDA builders
+            # classify the multi-token uniform rows as prefills and run the
+            # chunked-prefill path, whose fp32 recurrent-state transients
+            # (~num_reqs x local_heads x head_dim^2 per layer) can OOM the
+            # device before capture even starts.
+            use_spec_decode = self.speculative_config is not None and uniform_decode
+            if use_spec_decode:
+                accepted_tokens = np.asarray(num_scheduled_tokens_list, dtype=np.int32)
+                self.num_decode_draft_tokens.np[:num_reqs] = accepted_tokens - 1
+                self.num_accepted_tokens.np[:num_reqs] = accepted_tokens
+                if num_reqs_padded > num_reqs:
+                    self.num_decode_draft_tokens.np[num_reqs:num_reqs_padded] = (
+                        self.uniform_decode_query_len - 1
+                    )
+                    self.num_accepted_tokens.np[num_reqs:num_reqs_padded] = self.uniform_decode_query_len
+                self.num_decode_draft_tokens.copy_to_gpu()
+                self.num_accepted_tokens.copy_to_gpu()
+
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             # check how to build dummy
             if self.use_compress:
@@ -3524,6 +3544,7 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
+                use_spec_decode=use_spec_decode,
             )
             if not is_graph_capturing:
                 for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):

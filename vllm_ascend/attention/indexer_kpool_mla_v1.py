@@ -734,7 +734,10 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
         # The SFA base stores this tensor before post-processing.  Make that
         # write initialize one complete compressor-state row: [K, empty gate].
-        # CANN key_pool requires the state cache to be FP32.
+        # The dtype must match the allocated state cache, which is FP32 on
+        # both the A5 CANN key_pool path and the A3 triton/torch path
+        # (aclnnIndexPutImpl requires the scattered values to match the cache
+        # dtype exactly).
         state_k = k_li.to(torch.float32).view(-1, self.head_dim).unsqueeze(1)
         return torch.cat([state_k, torch.zeros_like(state_k)], dim=-1), None
 

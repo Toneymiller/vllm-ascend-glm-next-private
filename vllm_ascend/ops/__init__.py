@@ -20,6 +20,8 @@ from vllm.triton_utils import HAS_TRITON
 
 import vllm_ascend.ops.cann_kpool_loader  # noqa: F401
 import vllm_ascend.ops.fused_moe.fused_moe  # noqa
+import vllm_ascend.ops.glm5_next_kpool_state_compress  # noqa
+import vllm_ascend.ops.glm5_next_lightning_indexer  # noqa
 import vllm_ascend.ops.layernorm  # noqa
 import vllm_ascend.ops.register_custom_ops  # noqa
 
