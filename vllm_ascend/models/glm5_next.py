@@ -85,7 +85,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.indexer_kpool_mla_v1 import select_indexer_block_size
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.indexer_kpool_mla import (
@@ -100,7 +99,7 @@ from vllm_ascend.ops.triton.kda.kda import (
     rms_norm_gated,
 )
 from vllm_ascend.transformers_utils.configs.glm5_next import Glm5NextTextConfig
-from vllm_ascend.utils import is_950, uses_global_inputs_embeds
+from vllm_ascend.utils import uses_global_inputs_embeds
 
 INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
@@ -316,10 +315,9 @@ class AscendGlm5NextCompressorStateCache(CompressorStateCache):
     This is a sliding tail that occupies one page per request, not a tensor
     ring buffer indexed by position modulo. The state block table still maps
     each request's absolute logical pool position to the physical page owned
-    by the allocator. The state cache uses FP32 on both paths: CANN
-    ``key_pool`` (A5) requires it, and the A3 triton/torch kpool path keeps
-    the compressor window in FP32 as well so pool scores and K values are
-    only rounded to BF16 when the compressed pool enters the indexer cache.
+    by the allocator. The state cache uses FP32 so the compressor window
+    keeps full precision: pool scores and K values are only rounded to BF16
+    when the compressed pool enters the indexer cache.
     """
 
     def __init__(
@@ -1101,10 +1099,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         *,
         k: torch.Tensor | None = None,
         gate_score: torch.Tensor | None = None,
-        wk: torch.Tensor | None = None,
-        gate_weight: torch.Tensor | None = None,
-        norm_weight: torch.Tensor | None = None,
-        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
@@ -1115,10 +1109,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             weights,
             k=k,
             gate_score=gate_score,
-            wk=wk,
-            gate_weight=gate_weight,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
             compress_ape=compress_ape,
             index_kpool=index_kpool,
             positions=positions,
@@ -1132,10 +1122,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         *,
         k: torch.Tensor | None = None,
         gate_score: torch.Tensor | None = None,
-        wk: torch.Tensor | None = None,
-        gate_weight: torch.Tensor | None = None,
-        norm_weight: torch.Tensor | None = None,
-        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
@@ -1146,10 +1132,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             weights,
             k=k,
             gate_score=gate_score,
-            wk=wk,
-            gate_weight=gate_weight,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
             compress_ape=compress_ape,
             index_kpool=index_kpool,
             positions=positions,
@@ -1163,170 +1145,22 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         *,
         k: torch.Tensor | None = None,
         gate_score: torch.Tensor | None = None,
-        wk: torch.Tensor | None = None,
-        gate_weight: torch.Tensor | None = None,
-        norm_weight: torch.Tensor | None = None,
-        norm_bias: torch.Tensor | None = None,
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the kpool compress/write + select sequence.
+        """Run the kpool write/select/expand/tail forward sequence.
 
-        A5 uses the fused CANN ``key_pool``/``pool_key_indexer`` ops, while A3
-        keeps the triton/torch ops because the fused AscendC kernels regress
-        there.
-        """
-        if not is_950():
-            return self._forward_ascend_a3(
-                hidden_states,
-                q_quant,
-                weights,
-                k=k,
-                gate_score=gate_score,
-                compress_ape=compress_ape,
-                index_kpool=index_kpool,
-                positions=positions,
-            )
-        if wk is None or gate_weight is None:
-            raise ValueError("GLM-5 CANN kpool requires wk and gate_weight.")
-        if self.use_fp4_cache:
-            raise ValueError("Ascend GLM-5 Indexer uses BF16 Q, not FP4.")
-        if isinstance(q_quant, tuple):
-            q_values, q_scale = q_quant
-            if q_scale is not None:
-                q_values = q_values * q_scale.unsqueeze(-1).to(q_values.dtype)
-        else:
-            q_values = q_quant
-        if compress_ape is None or positions is None:
-            raise ValueError("GLM-5 kpool requires compress_ape and positions.")
-
-        context = get_forward_context()
-        metadata = context.attn_metadata
-        if not isinstance(metadata, dict):
-            raise TypeError("GLM-5 Indexer requires per-layer attention metadata.")
-        state_metadata = metadata[self.state_cache.prefix]
-        indexer_metadata = metadata[self.k_cache.prefix]
-        attn_metadata = metadata[self.attn_layer_name]
-        state_cache = self._bound_cache(self.state_cache)
-        indexer_cache = self._bound_cache(self.k_cache)
-        if not isinstance(state_cache, torch.Tensor):
-            raise TypeError("GLM-5 compressor state cache must be one tensor.")
-        if state_cache.dtype != torch.float32:
-            raise TypeError("GLM-5 compressor state cache must be float32 for CANN key_pool.")
-        if not isinstance(indexer_cache, torch.Tensor) or indexer_cache.dtype != torch.bfloat16:
-            raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
-
-        is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-        num_tokens = positions.shape[0] if is_full_graph else min(attn_metadata.num_actual_tokens, positions.shape[0])
-        cum_query_lens = attn_metadata.cum_query_lens
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=cum_query_lens.dtype, device=cum_query_lens.device),
-                cum_query_lens,
-            ]
-        )
-        start_pos = positions[:num_tokens][cu_seqlens[:-1].clamp_max(num_tokens - 1)].to(torch.int32)
-
-        pooled_key = torch_npu.key_pool(
-            hidden_states[:num_tokens],
-            wk,
-            gate_weight,
-            compress_ape,
-            state_cache,
-            state_metadata.block_table,
-            start_pos,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
-            cu_seqlens=cu_seqlens,
-            cmp_ratio=index_kpool,
-        )
-
-        selected = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            if is_full_graph
-            else (indexer_metadata.slot_mapping[:num_tokens] >= 0).nonzero().flatten()
-        )
-        if is_full_graph or selected.numel() > 0:
-            token_ids = torch.arange(num_tokens, device=hidden_states.device)
-            request_ids = torch.bucketize(
-                token_ids,
-                cu_seqlens,
-                right=True,
-            ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
-            first_pool = torch.div(
-                start_pos,
-                index_kpool,
-                rounding_mode="floor",
-            )
-            pool_idx = torch.div(
-                positions[:num_tokens][selected],
-                index_kpool,
-                rounding_mode="floor",
-            )
-            rows = pooled_key[
-                request_ids[selected],
-                (pool_idx - first_pool[request_ids[selected]]).clamp(0, pooled_key.shape[1] - 1),
-            ]
-            self._scatter_paged_cache(
-                indexer_cache,
-                indexer_metadata.slot_mapping[selected].to(torch.int64),
-                rows,
-                indexer_cache.shape[1],
-            )
-
-        indexer_block_size, indexer_blocks_per_logical = select_indexer_block_size(
-            indexer_cache.shape[1]
-        )
-        if indexer_blocks_per_logical > 1:
-            indexer_cache_for_op = indexer_cache.reshape(
-                indexer_cache.shape[0] * indexer_blocks_per_logical,
-                indexer_block_size,
-                *indexer_cache.shape[2:],
-            )
-        else:
-            indexer_cache_for_op = indexer_cache
-
-        indices, _ = torch_npu.pool_key_indexer(
-            q_values[:num_tokens],
-            indexer_cache_for_op,
-            weights[:num_tokens].to(q_values.dtype),
-            (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
-            actual_seq_q=cum_query_lens,
-            actual_seq_k=indexer_metadata.seq_lens,
-            block_table=indexer_metadata.block_table,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=self.topk_tokens,
-            pool_size=index_kpool,
-            mask_mode=3,
-            return_value=False,
-        )
-        return indices.unsqueeze(1)
-
-    def _forward_ascend_a3(
-        self,
-        hidden_states: torch.Tensor,
-        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        weights: torch.Tensor,
-        *,
-        k: torch.Tensor | None = None,
-        gate_score: torch.Tensor | None = None,
-        compress_ape: torch.Tensor | None = None,
-        index_kpool: int = 1,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the kpool write/select/expand/tail forward sequence on A3.
-
-        This is the pre-CANN path: K arrives already normed and rope-applied,
-        and both K and gate_score are FP32 so the compressor state keeps full
-        precision until the pool is compressed into the BF16 indexer cache.
-        One fused ``glm5_next_kpool_state_compress_and_write_cache`` op writes
-        the compressor state, gathers the pool window, compresses it, and
-        writes the indexer cache; ``glm5_next_lightning_indexer`` then does the
-        top-k select. Keeping the pre-compress sequence in one kernel avoids
-        the aclnnIndex/SearchSorted small-op flood the torch composition
-        lowers to.
+        Both A3 and A5 use this triton/torch path: K arrives already normed
+        and rope-applied, and both K and gate_score are FP32 so the compressor
+        state keeps full precision until the pool is compressed into the BF16
+        indexer cache. One fused ``glm5_next_kpool_state_compress_and_write_cache``
+        op writes the compressor state, gathers the pool window, compresses it,
+        and writes the indexer cache; ``glm5_next_lightning_indexer`` then does
+        the top-k select. Keeping the pre-compress sequence in one kernel avoids
+        the aclnnIndex/SearchSorted small-op flood the torch composition lowers
+        to, and sidesteps the AscendC ``key_pool``/``pool_key_indexer``
+        performance regression.
         """
         del hidden_states
         if self.use_fp4_cache:
@@ -1507,28 +1341,18 @@ class AscendGlm5NextIndexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        # A5 runs the fused CANN key_pool/pool_key_indexer ops (K norm and
-        # rope-on-K are fused into key_pool). A3 keeps the triton/torch ops,
-        # which need K materialized with norm and rope applied here.
-        use_cann_kpool = is_950()
-        k = None
-        gate_score = None
-        if use_cann_kpool:
-            kw, _ = self.wk_weights_proj(hidden_states)
-            weights = kw[:, self.head_dim :]
-        else:
-            # A3 runs the K/gate chain in FP32, matching the precision CANN
-            # key_pool keeps internally on A5: one widening cast of
-            # hidden_states feeds both projections, and K stays FP32 through
-            # the norm, so the compressor state only rounds to BF16 when the
-            # compressed pool enters the indexer cache.
-            hidden_f32 = hidden_states.float()
-            if self._wk_weight_f32 is None:
-                self._wk_weight_f32 = self.wk_weights_proj.weight.detach().float()
-                self._gate_weight_f32 = self.index_kpool_compress_gate.detach().float()
-            kw = torch.mm(hidden_f32, self._wk_weight_f32.t())
-            weights = kw[:, self.head_dim :].to(torch.bfloat16)
-            k = self.k_norm(kw[:, : self.head_dim])
+        # Both A3 and A5 run the triton/torch kpool ops, which need K
+        # materialized with norm and rope applied here. The K/gate chain runs
+        # in FP32: one widening cast of hidden_states feeds both projections,
+        # and K stays FP32 through the norm, so the compressor state only
+        # rounds to BF16 when the compressed pool enters the indexer cache.
+        hidden_f32 = hidden_states.float()
+        if self._wk_weight_f32 is None:
+            self._wk_weight_f32 = self.wk_weights_proj.weight.detach().float()
+            self._gate_weight_f32 = self.index_kpool_compress_gate.detach().float()
+        kw = torch.mm(hidden_f32, self._wk_weight_f32.t())
+        weights = kw[:, self.head_dim :].to(torch.bfloat16)
+        k = self.k_norm(kw[:, : self.head_dim])
 
         if self.rope_dim > 0:
             if rotary_emb is None:
@@ -1538,31 +1362,24 @@ class AscendGlm5NextIndexer(nn.Module):
                 [self.rope_dim, self.head_dim - self.rope_dim],
                 dim=-1,
             )
-            if use_cann_kpool:
-                q_pe, _ = rotary_emb(
-                    positions,
-                    q_pe,
-                    q_pe.unsqueeze(1),
-                )
-            else:
-                k_pe, k_nope = torch.split(
-                    k,
-                    [self.rope_dim, self.head_dim - self.rope_dim],
-                    dim=-1,
-                )
-                # npu_rotary_embedding computes a different rotation for FP32
-                # inputs (not rounding-level), so rope itself stays BF16; the
-                # values match the original chain, which rounded the norm
-                # output to BF16 before rope anyway. The nope half skips that
-                # rounding and keeps FP32.
-                k_pe = k_pe.to(torch.bfloat16)
-                q_pe, k_pe = rotary_emb(
-                    positions,
-                    q_pe,
-                    k_pe.unsqueeze(1),
-                )
-                k_pe = k_pe.reshape(-1, 1, self.rope_dim).float()
-                k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            k_pe, k_nope = torch.split(
+                k,
+                [self.rope_dim, self.head_dim - self.rope_dim],
+                dim=-1,
+            )
+            # npu_rotary_embedding computes a different rotation for FP32
+            # inputs (not rounding-level), so rope itself stays BF16; the
+            # values match the original chain, which rounded the norm
+            # output to BF16 before rope anyway. The nope half skips that
+            # rounding and keeps FP32.
+            k_pe = k_pe.to(torch.bfloat16)
+            q_pe, k_pe = rotary_emb(
+                positions,
+                q_pe,
+                k_pe.unsqueeze(1),
+            )
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim).float()
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
             q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
         q = q.to(torch.bfloat16)
@@ -1570,19 +1387,6 @@ class AscendGlm5NextIndexer(nn.Module):
         # Upstream folds the FP8 Q scale into weights. Q remains BF16 on
         # Ascend, so only the model-level factors are required.
         weights = weights * (self.softmax_scale * self.n_head**-0.5)
-        if use_cann_kpool:
-            return self.indexer_op(
-                hidden_states,
-                q,
-                weights,
-                wk=self.wk_weights_proj.weight[: self.head_dim],
-                gate_weight=self.index_kpool_compress_gate,
-                norm_weight=self.k_norm.weight,
-                norm_bias=self.k_norm.bias,
-                compress_ape=self.index_kpool_compress_ape,
-                index_kpool=self.index_kpool,
-                positions=positions,
-            )
         gate_score = torch.mm(hidden_f32, self._gate_weight_f32.t())
         return self.indexer_op(
             hidden_states,
