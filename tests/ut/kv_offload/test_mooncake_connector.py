@@ -17,6 +17,8 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
+
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
@@ -70,11 +72,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     ReqMeta,
+    build_layer_name_to_metadata_idx,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
+    resolve_remote_layer_idx,
     split_if_not_byte_contiguous,
     string_to_int64_hash,
+    transfer_groups_need_independent_block_ids,
     zmq_ctx,
 )
 
@@ -299,6 +304,256 @@ class TestKVCacheSendingThread(unittest.TestCase):
 
 
 class TestMooncakeTransferGroups(unittest.TestCase):
+    @staticmethod
+    def _build_glm5next_worker(block_size: int = 2176):
+        main_name = "model.layers.3.self_attn.attn"
+        index_name = "model.layers.3.self_attn.indexer.k_cache"
+        state_name = "model.layers.3.self_attn.indexer.compressor.state_cache"
+        main_spec = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            model_version="glm5_next",
+        )
+        index_spec = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            compress_ratio=4,
+            model_version="glm5_next",
+        )
+        state_spec = AscendIndexerKPoolStateSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=4,
+            cache_role="indexer_state",
+        )
+        attention_specs = {main_name: main_spec, index_name: index_spec}
+        cache_config = MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(
+                    layer_names=list(attention_specs),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=block_size,
+                        kv_cache_specs=attention_specs,
+                    ),
+                ),
+                MockKVCacheGroup(
+                    layer_names=[state_name],
+                    kv_cache_spec=state_spec,
+                ),
+            ]
+        )
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.model_config.hf_text_config.model_type = "glm5_next"
+        worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(return_value=1)
+        worker.total_layers = 45
+        worker.kv_cache_config = cache_config
+        worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(cache_config)
+        worker.kv_cache_group_block_sizes = (block_size, 4)
+        worker.sequence_block_size = block_size
+        return worker, main_name, index_name, state_name
+
+    def test_glm5next_real_specs_split_into_stable_transfer_planes(self):
+        worker, main_name, index_name, state_name = self._build_glm5next_worker()
+
+        groups = worker._build_kv_group2layeridx()
+
+        self.assertEqual(len(groups), 3)
+        main_group, index_group, state_group = groups.values()
+        self.assertEqual(main_group[0]["kv_cache_group_id"], 0)
+        self.assertEqual(index_group[0]["kv_cache_group_id"], 0)
+        self.assertEqual(state_group[0]["kv_cache_group_id"], 1)
+        self.assertEqual(main_group[0]["cache_role"], "kv")
+        self.assertEqual(index_group[0]["cache_role"], "indexer_k")
+        self.assertEqual(state_group[0]["cache_role"], "indexer_state")
+        self.assertEqual(main_group[0]["layer_names"], [main_name])
+        self.assertEqual(index_group[0]["layer_names"], [index_name])
+        self.assertEqual(state_group[0]["layer_names"], [state_name])
+        self.assertEqual(main_group[1], [3])
+        self.assertEqual(index_group[1], [2 * worker.total_layers + 3])
+        self.assertEqual(state_group[1], [3 * worker.total_layers + 3])
+
+    def test_glm5next_indexer_virtual_layout_matches_a3_and_a5_geometry(self):
+        class FakeTensor:
+            def __init__(self, shape, stride, element_size=2):
+                self.shape = torch.Size(shape)
+                self._stride = tuple(stride)
+                self._element_size = element_size
+
+            def stride(self, dim=None):
+                return self._stride if dim is None else self._stride[dim]
+
+            def element_size(self):
+                return self._element_size
+
+        for block_size, scale, slots in ((640, 5, 160), (2176, 17, 544)):
+            with self.subTest(block_size=block_size, scale=scale):
+                worker, main_name, index_name, _ = self._build_glm5next_worker(block_size)
+                worker.num_blocks = 2
+                worker.kv_group2layeridx = worker._build_kv_group2layeridx()
+                main = FakeTensor((2 * scale, 128, 1, 512), (65536, 512, 512, 1))
+                index = FakeTensor(
+                    (2, slots, 1, 128),
+                    (slots * 128, 128, 128, 1),
+                )
+
+                layout = worker._get_glm_indexer_kernel_layout(
+                    index_name,
+                    cast(torch.Tensor, index),
+                    {
+                        main_name: cast(torch.Tensor, main),
+                        index_name: cast(torch.Tensor, index),
+                    },
+                )
+
+                self.assertIsNotNone(layout)
+                actual_scale, block_stride, transfer_unit_tokens, virtual_shape = cast(
+                    tuple[int, int, int, torch.Size], layout
+                )
+                self.assertEqual(actual_scale, scale)
+                self.assertEqual(block_stride, 8192)
+                self.assertEqual(transfer_unit_tokens, 128)
+                self.assertEqual(virtual_shape, torch.Size((2 * scale, 32, 1, 128)))
+
+    def test_glm5next_kernel_ids_use_group_sizes_and_raw_index_prefix(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_cache_group_block_sizes = (2176, 4)
+        worker.sequence_block_size = 2176
+        worker.block_size_scale = [[] for _ in range(94)]
+        worker.block_size_scale[93] = [17]
+        group_spec = {
+            "kv_cache_spec_type": "MLAAttentionSpec",
+            "kv_cache_group_id": 0,
+            "cache_role": "indexer_k",
+            "kv_cache_spec": {"compress_ratio": 4},
+        }
+        meta = types.SimpleNamespace(
+            local_block_ids=([2], [6]),
+            remote_block_ids=([1], [4]),
+            remote_block_size=4,
+            remote_block_sizes=(1152, 4),
+            num_computed_tokens=128,
+            remote_request_id="glm-index",
+        )
+
+        local_ids, remote_ids = worker._get_kernel_block_ids([93], cast(ReqMeta, meta), 1, group_spec)
+
+        self.assertEqual(local_ids, list(range(34, 42)))
+        self.assertEqual(remote_ids, list(range(10, 18)))
+
+    def test_indexer_state_block_ids_select_committed_tail_with_mtp(self):
+        worker, _, _, _ = self._build_glm5next_worker()
+        worker.num_speculative_tokens = 3
+        worker.kv_group2layeridx = worker._build_kv_group2layeridx()
+        group_idx = 2
+        group_spec, layer_indices = worker.kv_group2layeridx[group_idx]
+        meta = types.SimpleNamespace(
+            local_block_ids=([2], [6, 7]),
+            local_full_block_ids=([2], [0, 8, 9]),
+            remote_block_ids=([1], [0, 3, 4]),
+            num_computed_tokens=4,
+            num_external_tokens=6,
+            remote_request_id="glm-indexer-state-mtp3",
+        )
+
+        local_ids, remote_ids = worker._get_kernel_block_ids(
+            layer_indices,
+            cast(ReqMeta, meta),
+            group_idx,
+            group_spec,
+        )
+
+        self.assertEqual(local_ids, [9])
+        self.assertEqual(remote_ids, [4])
+
+    def test_indexer_state_block_ids_skip_completed_pool_boundary(self):
+        worker, _, _, _ = self._build_glm5next_worker()
+        worker.num_speculative_tokens = 3
+        worker.kv_group2layeridx = worker._build_kv_group2layeridx()
+        group_idx = 2
+        group_spec, layer_indices = worker.kv_group2layeridx[group_idx]
+        meta = types.SimpleNamespace(
+            local_block_ids=([2], [6, 7]),
+            local_full_block_ids=([2], [0, 8, 9]),
+            remote_block_ids=([1], [0, 3, 4]),
+            num_computed_tokens=4,
+            num_external_tokens=4,
+            remote_request_id="glm-indexer-state-complete-pool",
+        )
+
+        local_ids, remote_ids = worker._get_kernel_block_ids(
+            layer_indices,
+            cast(ReqMeta, meta),
+            group_idx,
+            group_spec,
+        )
+
+        self.assertEqual(local_ids, [])
+        self.assertEqual(remote_ids, [])
+
+    def test_split_transfer_groups_get_independent_ids_and_name_mapping(self):
+        local_groups = {
+            0: (
+                {
+                    "kv_cache_group_id": 0,
+                    "cache_role": "kv",
+                    "layer_names": ["model.layers.3.self_attn.attn"],
+                },
+                [3],
+            ),
+            1: (
+                {
+                    "kv_cache_group_id": 0,
+                    "cache_role": "indexer_k",
+                    "layer_names": ["model.layers.3.self_attn.indexer.k_cache"],
+                },
+                [93],
+            ),
+        }
+        remote_groups = {
+            0: (local_groups[0][0], [3]),
+            1: (local_groups[1][0], [183]),
+        }
+
+        self.assertTrue(
+            transfer_groups_need_independent_block_ids(
+                local_groups,
+                [[17] if idx == 3 else [1] if idx == 93 else [] for idx in range(94)],
+            )
+        )
+        remote_name_to_idx = build_layer_name_to_metadata_idx(remote_groups)
+        self.assertEqual(
+            resolve_remote_layer_idx(
+                93,
+                local_groups[1][0],
+                local_groups[1][1],
+                remote_name_to_idx,
+            ),
+            183,
+        )
+
+    def test_minimax_m3_index_role_keeps_replicated_routing(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = MockVllmConfig()
+        worker.num_key_value_heads = 16
+        group_spec = {
+            "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+            "cache_role": "indexer_k",
+            "layer_names": ["model.layers.3.self_attn.index_cache"],
+            "kv_cache_spec": {"num_kv_heads": 1},
+        }
+
+        self.assertTrue(worker._is_m3_index_cache_group(group_spec))
+        self.assertFalse(worker._group_use_mla_rank_routing(group_spec))
+        self.assertEqual(worker._get_attention_group_num_key_value_heads(group_spec), 16)
+        self.assertTrue(worker._group_skip_kv_reformat(group_spec))
+
     def test_attention_group_uses_explicit_total_heads_for_unequal_pd_tp(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.num_key_value_heads = 16
@@ -368,6 +623,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
                 )
             ]
         )
+        worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(worker.kv_cache_config)
 
         kv_group2layeridx = worker._build_kv_group2layeridx()
 
@@ -410,6 +666,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
                 )
             ]
         )
+        worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(worker.kv_cache_config)
 
         kv_group2layeridx = worker._build_kv_group2layeridx()
 
@@ -926,6 +1183,35 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_indexer_state_consumes_preselected_blocks_with_mtp(self, mock_get_meta):
+        req = dict(self.test_req)
+        req["local_block_ids"] = [[3]]
+        req["remote_block_ids"] = [[9]]
+        self.thread.num_speculative_tokens = 3
+        self.thread.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendIndexerKPoolStateSpec",
+                    "cache_role": "indexer_state",
+                    "kv_cache_group_id": 0,
+                },
+                [0],
+            )
+        }
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
+            mock_config.return_value.enable_kv_nz = False
+            self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
+            self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1]]}
+            self.thread._transfer_kv_cache_all_groups(req)
+
+        call_args, _ = self.engine.batch_transfer_sync_read.call_args
+        self.assertEqual(call_args[1], [0x1000 + 3 * 1024])
+        self.assertEqual(call_args[2], [0x3000 + 9 * 1024])
+        self.assertEqual(call_args[3], [1024])
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_prefix_cache_offset_uses_compress_ratio(self, mock_get_meta):
         req = dict(self.test_req)
         req["local_block_ids"] = [[1, 2]]
@@ -1054,6 +1340,62 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(src_list, [0x1000 + 2 * 128, 0x2000 + 2 * 256])
         self.assertEqual(dst_list, [0x3000 + 3 * 160, 0x4000 + 3 * 512])
         self.assertEqual(length_list, [100, 200])
+
+    def test_append_glm5next_mamba_transfer_meta_uses_per_layer_shapes(self):
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+        self.thread.vllm_config.model_config.hf_text_config.model_type = "glm5_next_text"
+
+        conv_shape = (3, 12288)
+        ssm_shape = (32, 128, 128)
+        conv_dtype_size = 2
+        ssm_dtype_size = 4
+        local_conv_len = conv_dtype_size * 3 * 12288
+        local_ssm_len = ssm_dtype_size * 32 * 128 * 128
+        remote_conv_len = local_conv_len // 2
+        remote_ssm_len = local_ssm_len // 2
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [conv_shape, ssm_shape],
+                "dtype_sizes": [conv_dtype_size, ssm_dtype_size],
+            },
+            src_layer_base_addr=[0x10000000, 0x20000000],
+            dst_layer_base_addr=[0x30000000, 0x40000000],
+            block_len=[local_conv_len, local_ssm_len],
+            block_stride=[local_conv_len + 128, local_ssm_len + 256],
+            remote_block_stride=[remote_conv_len + 64, remote_ssm_len + 128],
+            remote_block_id=3,
+            local_block_id=2,
+            tp_num_need_pulls=2,
+            remote_tp_offset=1,
+        )
+
+        local_conv_base = 0x10000000 + 2 * (local_conv_len + 128)
+        remote_conv_base = 0x30000000 + 3 * (remote_conv_len + 64)
+        expected_src = [
+            local_conv_base + (row * 12288 + 6144) * conv_dtype_size
+            for row in range(3)
+        ]
+        expected_dst = [
+            remote_conv_base + row * 6144 * conv_dtype_size for row in range(3)
+        ]
+        expected_src.append(
+            0x20000000 + 2 * (local_ssm_len + 256) + remote_ssm_len
+        )
+        expected_dst.append(0x40000000 + 3 * (remote_ssm_len + 128))
+
+        self.assertEqual(src_list, expected_src)
+        self.assertEqual(dst_list, expected_dst)
+        self.assertEqual(
+            length_list,
+            [6144 * conv_dtype_size] * 3 + [remote_ssm_len],
+        )
 
     def test_transfer_kv_cache_failure(self):
         self.engine.batch_transfer_sync_read.return_value = -1
@@ -1327,6 +1669,8 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
                 "remote_pcp_size": 1,
                 "remote_dcp_size": 1,
                 "remote_ptp_size": 2,
+                "remote_block_size": 1152,
+                "remote_block_sizes": [1152, 4, 1024],
             },
         )
 
@@ -1340,6 +1684,8 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         self.assertEqual(req_meta.remote_host, "localhost")
         self.assertEqual(req_meta.remote_port, 5000)
         self.assertEqual(req_meta.remote_ptp_size, 2)
+        self.assertEqual(req_meta.remote_block_size, 1152)
+        self.assertEqual(req_meta.remote_block_sizes, (1152, 4, 1024))
 
 
 class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
@@ -1413,6 +1759,10 @@ class TestHelperFunctions(unittest.TestCase):
         src_groups, dst_groups = group_concurrent_contiguous(src, dst)
         self.assertEqual(src_groups, [])
         self.assertEqual(dst_groups, [])
+
+    def test_group_concurrent_contiguous_rejects_mismatched_lengths(self):
+        with self.assertRaisesRegex(ValueError, "different lengths"):
+            group_concurrent_contiguous([1, 2], [10])
 
     def test_group_concurrent_contiguous_uses_stride_for_memory_contiguity(self):
         src: list[int] = [1, 2]
@@ -1639,6 +1989,20 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         delay_free, params = self.scheduler.request_finished(request, [1, 2, 3])
         self.assertFalse(delay_free)
         self.assertIsNone(params)
+
+    def test_request_finished_exports_per_logical_group_block_sizes(self):
+        self.scheduler.sequence_block_size = 1152
+        self.scheduler.kv_cache_group_block_sizes = (1152, 4, 1024)
+        request = self._make_remote_decode_request(prompt_len=16)
+
+        _, params = self.scheduler.request_finished(request, ([1],))
+
+        self.assertIsNotNone(params)
+        self.assertEqual(cast(dict[str, Any], params)["remote_block_size"], 1152)
+        self.assertEqual(
+            cast(dict[str, Any], params)["remote_block_sizes"],
+            (1152, 4, 1024),
+        )
 
     def test_get_transfer_block_ids_trims_attention_mtp_blocks(self):
         self.scheduler.group_transfer_info = [
@@ -2380,6 +2744,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 worker.tp_size = 2
                 worker.tp_rank = dcp_rank
                 worker.block_size = 32
+                worker.kv_cache_group_block_sizes = (32,)
                 worker.num_key_value_heads = 1
                 worker._prefill_tp_size = 4
                 worker.local_remote_block_port_mapping = {}
