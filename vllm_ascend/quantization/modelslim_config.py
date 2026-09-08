@@ -300,8 +300,16 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
         ],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     },
+    "glm5_next": {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "experts": [
+            "experts.0.gate_proj",
+            "experts.0.up_proj",
+            "experts.0.down_proj",
+        ],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    },
 }
-
 
 QUANT_MODEL_PREFIX_MAPPINGS = {
     "deepseek_v4": {
@@ -310,7 +318,6 @@ QUANT_MODEL_PREFIX_MAPPINGS = {
         "head.": "lm_head.",
     },
 }
-
 
 QUANT_MODEL_SUBSTR_MAPPINGS = {
     "deepseek_v4": {
@@ -327,6 +334,15 @@ QUANT_MODEL_SUBSTR_MAPPINGS = {
     # (e.g. "model.layers.45.self_attn.q_proj.weight"). Strip it so the quant
     # lookup matches the on-disk naming.
     "step3p5_mtp": {
+        ".mtp_block.": ".",
+    },
+    "glm5_next_mtp": {
+        ".mtp_block.": ".",
+    },
+    "glm5_next": {
+        ".mtp_block.": ".",
+    },
+    "glm5_next_text": {
         ".mtp_block.": ".",
     },
 }
@@ -585,6 +601,18 @@ class AscendModelSlimConfig(QuantizationConfig):
                 orig_to_new_substr=substr_mapping or {},
             )
             prefix = hf_to_vllm_mapper._map_name(prefix)
+
+        if model_type == "glm5_next" and prefix.startswith("model.layers."):
+            packed_mapping = self.packed_modules_mapping
+
+            if not self._has_quant_weight(prefix, packed_mapping):
+                candidate = prefix.replace(
+                    "model.layers.",
+                    "language_model.model.layers.",
+                    1,
+                )
+                if self._has_quant_weight(candidate, packed_mapping):
+                    return candidate
 
         if model_type == "step3p5_mtp" and prefix.startswith("model.layers."):
             # Step3P5 MTP and newly generated Step3P7 W8A8 MTP checkpoints use

@@ -67,6 +67,7 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.pre-commit-cache/
 nosetests.xml
 coverage.xml
 *.cover

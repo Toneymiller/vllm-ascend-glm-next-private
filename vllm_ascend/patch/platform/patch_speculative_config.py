@@ -1,5 +1,6 @@
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
+import vllm.config.speculative as speculative_config
 from vllm.config.speculative import SpeculativeConfig
 from vllm.utils.import_utils import LazyLoader
 
@@ -116,6 +117,16 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
         hf_config.update({"n_predict": n_predict, "architectures": ["LongCatFlashMTPModel"]})
 
+    if hf_config.model_type in ("glm5_next", "glm5_next_text"):
+        hf_config.model_type = "glm5_next_mtp"
+        n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        hf_config.update(
+            {
+                "n_predict": n_predict,
+                "architectures": ["Glm5NextMTPModel"],
+            }
+        )
+
     if hf_config.model_type in ("step3p5", "step3p7") or hf_config.architectures[0] in (
         "Step3p5ForCausalLM",
         "Step3p7ForConditionalGeneration",
@@ -133,5 +144,11 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
 
     return hf_config
 
+
+if "glm5_next_mtp" not in get_args(speculative_config.MTPModelTypes):
+    speculative_config.MTPModelTypes = Literal[
+        *get_args(speculative_config.MTPModelTypes),
+        "glm5_next_mtp",
+    ]
 
 SpeculativeConfig.hf_config_override = hf_config_override

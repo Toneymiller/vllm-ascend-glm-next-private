@@ -1206,7 +1206,7 @@ def chunk_kda(
         g=g.contiguous(),
         beta=beta.contiguous(),
         scale=scale,
-        initial_state=initial_state.contiguous(),
+        initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         prebuilt_meta=prebuilt_meta,
@@ -1237,12 +1237,13 @@ def kda_gate_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
     b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
 
     stride_row = H * D
     stride_col = 1
@@ -1273,16 +1274,20 @@ def kda_gate_fwd_kernel(
         b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(tl.float32)
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * tl.log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if SAFE_GATE:
+        # Kimi K3's numerically bounded gate:
+        #   lower_bound * sigmoid((raw_g + dt_bias) * exp(A_log))
+        b_y = LOWER_BOUND * tl.sigmoid(b_g * tl.exp(b_a))
+    else:
+        # Original KDA gate:
+        #   -exp(A_log) * softplus(raw_g + dt_bias)
+        # Use the linear approximation above ``threshold`` to avoid overflow.
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(use_linear, b_g, (1.0 / beta) * tl.log(1.0 + tl.exp(g_scaled)))
+        b_y = -tl.exp(b_a) * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
-
 
 def fused_kda_gate(
     g: torch.Tensor,
@@ -1291,6 +1296,8 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
@@ -1298,8 +1305,13 @@ def fused_kda_gate(
       param A: [H] or [1, 1, H, 1]
       beta: softplus beta parameter
       threshold: softplus threshold parameter
+      safe_gate: use Kimi K3's bounded sigmoid gate instead of the original
+                 negative-softplus gate
+      lower_bound: negative lower bound used by ``safe_gate``
       return  : [..., H, D]
     """
+    if safe_gate and not -5.0 <= lower_bound < 0.0:
+        raise ValueError(f"lower_bound must be in [-5, 0), got {lower_bound}.")
     orig_shape = g.shape[:-1]
 
     g = g.view(-1, g.shape[-1])
@@ -1325,6 +1337,8 @@ def fused_kda_gate(
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        SAFE_GATE=safe_gate,
+        LOWER_BOUND=lower_bound,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)

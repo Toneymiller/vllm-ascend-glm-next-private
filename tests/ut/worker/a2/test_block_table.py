@@ -308,6 +308,51 @@ class TestBlockTableComputeSlotMapping(TestBase):
             dcp_world_size=4, pcp_world_size=2, cp_kv_cache_interleave_size=128, test_configs=test_configs
         )
 
+    def test_uniform_mamba_group_keeps_speculative_block_capacity(self):
+        from vllm.v1.kv_cache_interface import (
+            KVCacheGroupSpec,
+            MambaSpec,
+            UniformTypeKVCacheSpecs,
+        )
+
+        from vllm_ascend.worker.block_table import BlockTable
+
+        group = MagicMock(spec=GroupCoordinator)
+        group.world_size = 1
+        group.rank_in_group = 0
+        mamba_spec = MambaSpec(
+            block_size=16400,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            num_speculative_blocks=1,
+        )
+        cache_group = KVCacheGroupSpec(
+            layer_names=["draft.mamba"],
+            kv_cache_spec=UniformTypeKVCacheSpecs(
+                block_size=16400,
+                kv_cache_specs={"draft.mamba": mamba_spec},
+            ),
+        )
+        with (
+            patch("vllm_ascend.worker.block_table.get_dcp_group", return_value=group),
+            patch("vllm_ascend.worker.block_table.get_pcp_group", return_value=group),
+        ):
+            block_table = BlockTable(
+                block_size=16400,
+                max_num_reqs=4,
+                max_num_blocks_per_req=2,
+                max_num_batched_tokens=8,
+                pin_memory=False,
+                device=torch.device("cpu"),
+                kernel_sizes=[0],
+                kv_cache_group=cache_group,
+            )
+
+        self.assertTrue(block_table.is_mamba_group)
+        self.assertEqual(block_table.block_table.np.shape, (4, 2))
+        block_table.add_row([1, 2], 0)
+        np.testing.assert_array_equal(block_table.block_table.np[0], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

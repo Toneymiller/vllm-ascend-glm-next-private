@@ -8,3 +8,18 @@ def register_model():
     ModelRegistry.register_model(
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"
     )
+    ModelRegistry.register_model(
+        "Glm5NextForCausalLM", "vllm_ascend.models.glm5_next:AscendGlm5NextForCausalLM"
+    )
+    ModelRegistry.register_model(
+        "Glm5NextForConditionalGeneration",
+        "vllm_ascend.models.glm5_next_multimodal:AscendGlm5NextForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "Glm5NextMTPModel",
+        "vllm_ascend.models.glm5_next_mtp:AscendGlm5NextMTP",
+    )
+    ModelRegistry.register_model(
+        "Glm5NextMTP",
+        "vllm_ascend.models.glm5_next_mtp:AscendGlm5NextMTP",
+    )

@@ -217,7 +217,7 @@ template <typename SFAT> __aicore__ inline void SparseFlashAttentionMla<SFAT>::I
     constInfo.s2BaseSize = tilingData->innerSplitParams.s2BaseSize;
     constInfo.kvHeadNum = kvHeadNum;
     constInfo.headDim = headDim;
-    constInfo.headDimRope = headDimRope;
+    constInfo.headDimRope = tilingData->baseParams.ropeHeadDim;
     constInfo.sparseBlockSize = tilingData->baseParams.sparseBlockSize;
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
@@ -443,8 +443,10 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
     keyGm.SetGlobalBuffer((__gm__ KV_T *)keyPtr);
     valueGm.SetGlobalBuffer((__gm__ KV_T *)valuePtr);
-    qRopeGm.SetGlobalBuffer((__gm__ Q_ROPE_T *)queryRope);
-    kRopeGm.SetGlobalBuffer((__gm__ K_ROPE_T *)keyRope);
+    if (constInfo.headDimRope > 0) {
+        qRopeGm.SetGlobalBuffer((__gm__ Q_ROPE_T *)queryRope);
+        kRopeGm.SetGlobalBuffer((__gm__ K_ROPE_T *)keyRope);
+    }
 
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
     softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
@@ -673,13 +675,17 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::CalcParams(uint32_t loop, 
     info.tndBIdxOffsetForKV = actualSeqKVPrefixSum * constInfo.kvHeadNum * headDim;
 
     if (info.isFirstSInnerLoop) {
-        uint64_t tndBIdxRopeOffsetForQ = actualSeqQPrefixSum * constInfo.qHeadNum * headDimRope;
         tensorACoreOffset = info.tndBIdxOffsetForQ + info.gS1Idx * headDim;
-        tensorARopeCoreOffset = tndBIdxRopeOffsetForQ + info.gS1Idx * headDimRope;
-        
-        uint64_t tndBIdxRopeOffsetForK = actualSeqKVPrefixSum * constInfo.kvHeadNum * headDimRope;
         tensorBCoreOffset = info.tndBIdxOffsetForKV + info.n2Idx * headDim;
-        tensorBRopeCoreOffset = tndBIdxRopeOffsetForK + info.n2Idx * headDimRope;
+        if (constInfo.headDimRope > 0) {
+            uint64_t tndBIdxRopeOffsetForQ = actualSeqQPrefixSum * constInfo.qHeadNum * constInfo.headDimRope;
+            tensorARopeCoreOffset = tndBIdxRopeOffsetForQ + info.gS1Idx * constInfo.headDimRope;
+            uint64_t tndBIdxRopeOffsetForK = actualSeqKVPrefixSum * constInfo.kvHeadNum * constInfo.headDimRope;
+            tensorBRopeCoreOffset = tndBIdxRopeOffsetForK + info.n2Idx * constInfo.headDimRope;
+        } else {
+            tensorARopeCoreOffset = 0;
+            tensorBRopeCoreOffset = 0;
+        }
         if (constInfo.sparseMode == 3) {
             threshold = static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + info.gS1Idx / constInfo.gSize + 1;
         } else {

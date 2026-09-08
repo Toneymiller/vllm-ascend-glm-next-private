@@ -259,7 +259,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
           1. Fetch `mc2_mask` and target padding length from forward context.
           2. Pad `hidden_states` and `router_logits` to target length if needed.
           3. If TP > 1, split tensors along token dimension and select current TP rank's slice.
-          4. Split and return corresponding `mc2_mask`.
+          4. Align `mc2_mask` with the resulting hidden-state rows.
 
         Skips padding/slicing if `enable_shared_expert_dp` or `replace_allreduce` is True.
 
@@ -269,10 +269,6 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
-        if self.tp_size > 1:
-            # Also slice mc2_mask
-            split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
-            mc2_mask = split_mc2_mask[self.tp_rank]
 
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
@@ -292,6 +288,22 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
+
+        if self.tp_size > 1 and mc2_mask.shape[0] != hidden_states.shape[0]:
+            # FlashComm shared-expert execution keeps the global token rows,
+            # while regular MC2 slices them by TP. Align the mask with the
+            # rows actually passed to the dispatcher instead of always slicing.
+            rank_mc2_mask = torch.tensor_split(
+                mc2_mask,
+                self.tp_size,
+                dim=0,
+            )[self.tp_rank]
+            if rank_mc2_mask.shape[0] == hidden_states.shape[0]:
+                mc2_mask = rank_mc2_mask
+            elif mc2_mask.shape[0] > hidden_states.shape[0]:
+                # MTP draft steps can carry a padded global mask while their
+                # eager hidden states contain only the active token rows.
+                mc2_mask = mc2_mask[: hidden_states.shape[0]]
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,

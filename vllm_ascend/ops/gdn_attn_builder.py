@@ -485,57 +485,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata
 
-    def _fold_spec_sized_prefill_chunks_into_spec(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        spec_sequence_masks_cpu: torch.Tensor,
-        num_accepted_tokens: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Restore the pre-#11735 state contract for spec-sized prompt chunks.
-
-        Decode-graph dispatch is shape based: a prompt chunk of exactly
-        num_spec + 1 tokens (typically the final chunk of a prompt) is
-        shape-identical to a speculative decode row, so its step can replay a
-        decode graph. Before #11735 the replay refreshed conv1d parameters
-        from the live per-step metadata, so such a row still updated its own
-        state; afterwards the graph reads padded buffers that are only filled
-        for pure decode batches, leaving the row's conv/recurrent state stale
-        and its output garbled from the first decoded token. Fold the row
-        into the spec metadata with all tokens accepted, which advances its
-        state over the whole chunk exactly like the prefill path would. Rows
-        without prior state (first chunks) stay on the prefill path.
-        """
-        is_prefilling = common_attn_metadata.is_prefilling
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
-        if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
-            return spec_sequence_masks_cpu, num_accepted_tokens
-
-        # The common metadata CPU tensors are padded; only the leading entries
-        # correspond to requests in this batch.
-        num_reqs = min(
-            spec_sequence_masks_cpu.numel(),
-            is_prefilling.numel(),
-            seq_lens_cpu.numel(),
-        )
-        is_prefilling = is_prefilling[:num_reqs]
-        seq_lens_cpu = seq_lens_cpu[:num_reqs]
-        query_lens_cpu = torch.diff(common_attn_metadata.query_start_loc_cpu)[:num_reqs]
-        fold = (
-            is_prefilling
-            & ~spec_sequence_masks_cpu
-            & (query_lens_cpu == self.num_spec + 1)
-            & (seq_lens_cpu > query_lens_cpu)
-        )
-        fold_indices = fold.nonzero(as_tuple=True)[0]
-        if fold_indices.numel() == 0:
-            return spec_sequence_masks_cpu, num_accepted_tokens
-
-        spec_sequence_masks_cpu = spec_sequence_masks_cpu.clone()
-        spec_sequence_masks_cpu[fold_indices] = True
-        num_accepted_tokens = num_accepted_tokens.clone()
-        num_accepted_tokens[fold_indices.to(num_accepted_tokens.device)] = self.num_spec + 1
-        return spec_sequence_masks_cpu, num_accepted_tokens
-
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -572,9 +521,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 out=spec_sequence_masks_cpu,
             )
-            spec_sequence_masks_cpu, num_accepted_tokens = self._fold_spec_sized_prefill_chunks_into_spec(
-                m, spec_sequence_masks_cpu, num_accepted_tokens
-            )
+            # NOTE: spec-sized (num_spec + 1) prefill tail chunks are not
+            # folded into the spec metadata. The model runner only dispatches
+            # a decode graph once every prompt is fully computed, so such
+            # chunks always run on the live prefill path; folding them would
+            # force an all-tokens-accepted state commit that corrupts the
+            # request's conv/recurrent state under concurrent batches.
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0:
                 spec_sequence_masks = None

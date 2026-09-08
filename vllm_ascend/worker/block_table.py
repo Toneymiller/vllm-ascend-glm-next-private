@@ -8,6 +8,8 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
 
 class BlockTable:
     def __init__(
@@ -28,21 +30,22 @@ class BlockTable:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
         self.dcp_world_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
+
+        kv_cache_spec = getattr(kv_cache_group, "kv_cache_spec", None)
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()), None)
         compress_ratio = 1
-        if (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and isinstance(kv_cache_group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        ):
-            kv_cache_spec = next(iter(kv_cache_group.kv_cache_spec.kv_cache_specs.values()), None)
-            if kv_cache_spec is not None and hasattr(kv_cache_spec, "compress_ratio"):
-                compress_ratio = kv_cache_spec.compress_ratio
-        if (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and (self.pcp_world_size * self.dcp_world_size > 1)
-            and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
-        ):
+        # Only AscendMLAAttentionSpec is registered with a compress-aware
+        # manager (CompressAttentionManager) that divides the token count by
+        # compress_ratio when allocating blocks. For other specs that merely
+        # carry a compress_ratio field (e.g. the GLM-5 indexer kpool cache,
+        # which uses the upstream MLAAttentionSpec -> FullAttentionManager),
+        # the scheduler still allocates cdiv(tokens, block_size) blocks per
+        # request, so shrinking the row capacity here would overflow the
+        # block table row on long sequences and kill the engine.
+        if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+            compress_ratio = kv_cache_spec.compress_ratio
+        if self.pcp_world_size * self.dcp_world_size > 1 and isinstance(kv_cache_spec, MambaSpec):
             max_num_blocks_per_req = max_num_blocks_per_req * self.pcp_world_size * self.dcp_world_size
         max_num_blocks_per_req = max(cdiv(max_num_blocks_per_req, compress_ratio), 1)
         self.max_num_blocks_per_req = max_num_blocks_per_req
@@ -50,11 +53,7 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
-        self.is_mamba_group = (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
-        )
+        self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
 
         # If kernel_sizes is None or [0], use physical block size (no splitting)
         if kernel_sizes is None or kernel_sizes == [0]:
@@ -114,6 +113,17 @@ class BlockTable:
 
         num_blocks = len(block_ids)
         start = self.num_blocks_per_row[row_idx]
+
+        capacity = self.block_table.np.shape[1]
+        if start + num_blocks > capacity:
+            raise ValueError(
+                "Block table row capacity exceeded: "
+                f"row={row_idx}, start={start}, received={num_blocks}, "
+                f"capacity={capacity}, physical_block_size={self.physical_block_size}, "
+                f"logical_block_size={self.logical_block_size}, "
+                f"max_num_blocks_per_req={self.max_num_blocks_per_req}, "
+                f"use_hybrid_blocks={self.use_hybrid_blocks}"
+            )
 
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self.num_blocks_per_row[row_idx] += num_blocks
@@ -399,7 +409,10 @@ class MultiGroupBlockTable:
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
-            block_table.add_row(block_ids[i], row_idx)
+            try:
+                block_table.add_row(block_ids[i], row_idx)
+            except ValueError as error:
+                raise ValueError(f"KV cache group {i}: {error}") from error
 
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:

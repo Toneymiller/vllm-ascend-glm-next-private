@@ -661,6 +661,15 @@ class ShardedCPColumnParallelOp(CustomColumnParallelOp):
         return output, output_bias
 
 
+def _is_vision_encoder_prefix(prefix: str) -> bool:
+    """Vision towers precompute inputs_embeds outside the forward context.
+
+    SP/FC2 ops depend on forward-context flags (upstream #10941). GLM-5-Next
+    names its tower ``visual`` while Step3p7 uses ``vision_model``.
+    """
+    return "vision_model" in prefix or "visual" in prefix
+
+
 def _get_column_parallel_op(
     prefix, layer
 ) -> (
@@ -691,7 +700,7 @@ def _get_column_parallel_op(
             "query_key_value",  # qkv linear of Bailing
         ]
         for a_prefix in sp_column_prefix:
-            if a_prefix in prefix:
+            if a_prefix in prefix and not _is_vision_encoder_prefix(prefix):
                 return SequenceColumnParallelOp(layer)
 
     return None
@@ -720,7 +729,7 @@ def _get_row_parallel_op(
     if matmul_allreduce_enable():
         return MatmulAllreduceRowParallelOp(layer)
     if flashcomm2_enable():
-        if "o_proj" in prefix or "out_proj" in prefix:
+        if ("o_proj" in prefix or "out_proj" in prefix) and not _is_vision_encoder_prefix(prefix):
             return Flashcomm2OProjRowParallelOp(layer)
     if enable_sp():
         if "shared_expert" in prefix:
@@ -733,7 +742,7 @@ def _get_row_parallel_op(
             "wo_b",  # attn output linear of v4
         ]
         for a_prefix in sp_row_prefixes:
-            if a_prefix in prefix:
+            if a_prefix in prefix and not _is_vision_encoder_prefix(prefix):
                 return SequenceRowParallelOp(layer)
 
     return None

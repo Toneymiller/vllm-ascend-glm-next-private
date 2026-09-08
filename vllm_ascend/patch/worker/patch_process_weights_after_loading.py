@@ -15,10 +15,17 @@ from vllm.model_executor.model_loader import base_loader, utils
 from vllm.model_executor.model_loader.reload import set_torchao_reload_attrs
 from vllm.model_executor.model_loader.utils import device_loading_context
 
+_ASCEND_ATTENTION_POST_LOAD_TYPES = frozenset(
+    {
+        ("vllm_ascend.models.layer.attention.layer", "DSAAttention"),
+        ("vllm_ascend.ops.indexer_kpool_mla", "AscendIndexerKPoolMLAAttention"),
+    }
+)
 
-def _is_dsa_attention(module: nn.Module) -> bool:
+
+def _is_ascend_attention(module: nn.Module) -> bool:
     module_cls = type(module)
-    return module_cls.__module__ == "vllm_ascend.models.layer.attention.layer" and module_cls.__name__ == "DSAAttention"
+    return (module_cls.__module__, module_cls.__name__) in _ASCEND_ATTENTION_POST_LOAD_TYPES
 
 
 def ascend_process_weights_after_loading(
@@ -38,9 +45,10 @@ def ascend_process_weights_after_loading(
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
     for _, module in model.named_modules():
-        if (isinstance(module, (Attention, MLAAttention, MMEncoderAttention)) or _is_dsa_attention(module)) and hasattr(
-            module, "process_weights_after_loading"
-        ):
+        if (
+            isinstance(module, (Attention, MLAAttention, MMEncoderAttention))
+            or _is_ascend_attention(module)
+        ) and hasattr(module, "process_weights_after_loading"):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             with device_loading_context(module, target_device):

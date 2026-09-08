@@ -31,6 +31,7 @@ from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -40,6 +41,7 @@ from vllm.v1.spec_decode.utils import (
     extend_all_queries_by_N,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -346,6 +348,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         for _ in range(self.num_speculative_tokens):
             self.piece_all_attn_layer_name.append([name for name in self.attn_layer_names])
 
+        if self.supports_mm_inputs:
+            try:
+                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
+                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
+            except (NotImplementedError, AttributeError, TypeError):
+                logger.warning(
+                    "Draft model does not support multimodal inputs, "
+                    "falling back to text-only mode"
+                )
+                self.supports_mm_inputs = False
+
         if supports_multimodal(model):
             # handle multimodality
             if self.get_model_name(model) in [
@@ -355,6 +368,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",
+                "AscendGlm5NextForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = model.config.image_token_id
             elif self.get_model_name(model) == "PixtralForConditionalGeneration":
@@ -370,7 +384,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # share embed_tokens with the target model if needed
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
-        self._maybe_share_lm_head(model)
+        self._maybe_share_lm_head(target_language_model)
 
         if (
             self.parallel_drafting
@@ -382,6 +396,95 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.eagle3_use_aux_hidden_state
                 else self.model.mask_hidden.view(self.hidden_size)
             )
+
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
+    ) -> None:
+        """Initialize metadata builders for every draft KV cache group.
+
+        GLM-next MTP has separate main MLA, compressed indexer, and
+        compressor-state cache layers with distinct backends/specs. Main MLA
+        and compressed indexer intentionally share one KV cache group ID.
+        """
+        all_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+
+        draft_layer_to_gid: dict[str, int] = {}
+        attention_groups: dict[tuple[str, int], AttentionGroup] = {}
+        for gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            draft_layer_names = self._draft_attn_layer_names & set(kv_cache_group.layer_names)
+            for layer_name in sorted(draft_layer_names):
+                draft_layer_to_gid[layer_name] = gid
+                attn_layer = all_attn_layers[layer_name]
+                attn_backend = attn_layer.get_attn_backend()
+                group_key = (attn_backend.full_cls_name(), gid)
+                if group_key in attention_groups:
+                    attention_groups[group_key].layer_names.append(layer_name)
+                    continue
+
+                layer_kv_cache_spec = kv_cache_group.kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                kernel_block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                    else None
+                )
+                # The compressed indexer shares the main MLA block table. Its
+                # builder needs the manager block size to collapse the table's
+                # kernel-sized sub-blocks back into scheduler blocks.
+                if getattr(attn_layer, "cache_role", "kv") == "indexer":
+                    kernel_block_size = None
+                attn_group = AttentionGroup(
+                    backend=attn_backend,
+                    layer_names=[layer_name],
+                    kv_cache_spec=layer_kv_cache_spec,
+                    kv_cache_group_id=gid,
+                )
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size=kernel_block_size,
+                )
+                attention_groups[group_key] = attn_group
+
+        missing_layers = self._draft_attn_layer_names - draft_layer_to_gid.keys()
+        assert not missing_layers, f"Draft layers missing from KV cache config: {sorted(missing_layers)}"
+
+        primary_layer_name = next(
+            (
+                layer_name
+                for layer_name in self.attn_layer_names
+                if getattr(all_attn_layers[layer_name], "cache_role", "kv") == "kv"
+            ),
+            self.attn_layer_names[0],
+        )
+        self.kv_cache_gid = draft_layer_to_gid[primary_layer_name]
+        self.draft_attn_groups = sorted(
+            attention_groups.values(),
+            key=lambda group: (group.kv_cache_group_id != self.kv_cache_gid, group.kv_cache_group_id),
+        )
+        self._slot_mapping_group_by_gid = {
+            group.kv_cache_group_id: [
+                torch.zeros_like(self.slot_mapping_group[0])
+                for _ in range(self.num_speculative_tokens)
+            ]
+            for group in self.draft_attn_groups
+        }
+
+        primary_attn_group = next(
+            group for group in self.draft_attn_groups if primary_layer_name in group.layer_names
+        )
+        self.block_size = primary_attn_group.get_metadata_builder().kv_cache_spec.block_size
+        logger.debug(
+            "Using block size %d for %d drafting KV cache groups",
+            self.block_size,
+            len({group.kv_cache_group_id for group in self.draft_attn_groups}),
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -451,7 +554,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
     # share lm_head with the target model if needed
-    def _maybe_share_lm_head(self, model: nn.Module) -> None:
+    def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
         if self.method in ("eagle", "dflash"):
@@ -473,10 +576,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             else:
                 logger.info("[spec_decode/base] Loading EAGLE/DFLASH LM head weights from the target model.")
-                if hasattr(model, "lm_head"):
-                    self.model.lm_head = model.lm_head
-                elif hasattr(model, "get_language_model") and hasattr(model.get_language_model(), "lm_head"):
-                    self.model.lm_head = model.get_language_model().lm_head
+                if hasattr(target_language_model, "lm_head"):
+                    self.model.lm_head = target_language_model.lm_head
                 else:
                     logger.warning(
                         "[spec_decode/base] Target model has no accessible lm_head"
@@ -486,9 +587,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
 
         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
+            if not hasattr(target_language_model, "lm_head"):
+                raise AttributeError(
+                    "Target language model does not expose lm_head required "
+                    "by the MLA MTP draft model."
+                )
             for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
-                    layer_module.shared_head.head = model.lm_head
+                layer_module.shared_head.head = target_language_model.lm_head
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
@@ -899,32 +1004,41 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
-        extra_attn_metadata_args: dict = {}
-        if self.use_compress:
-            extra_attn_metadata_args = dict(
-                prefill_ratio_to_sas_metadata=dict(),
-                decode_ratio_to_sas_metadata=dict(),
-                common_ratio_to_sas_metadata=dict(),
-                block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
-            )
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
+        per_layer_attn_metadata = dict()
+        for attn_group in self.draft_attn_groups:
+            group_common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+            group_block_table = self.runner.input_batch.block_table[attn_group.kv_cache_group_id]
+            group_common_attn_metadata.block_table_tensor = group_block_table.get_device_tensor()
+            group_common_attn_metadata.slot_mapping = group_block_table.slot_mapping.gpu
 
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-            attn_metadata.attn_mask = None
+            extra_attn_metadata_args: dict = {}
+            if self.use_compress and attn_group.kv_cache_group_id == self.kv_cache_gid:
+                extra_attn_metadata_args = dict(
+                    prefill_ratio_to_sas_metadata=dict(),
+                    decode_ratio_to_sas_metadata=dict(),
+                    common_ratio_to_sas_metadata=dict(),
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
+            attn_metadata = attn_group.get_metadata_builder().build(
+                0,
+                group_common_attn_metadata,
+                self.runner.get_model(),
+                **extra_attn_metadata_args,
+            )
+            if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+                attn_metadata.attn_mask = None
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+        attn_metadata = attn_metadata_i
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -974,19 +1088,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Copy the old attn_metadata and update
             for draft_index in range(1, self.num_speculative_tokens):
                 per_layer_attn_metadata = dict()
-                for attn_group in self.draft_attn_groups:
-                    common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+                for group_index, attn_group in enumerate(self.draft_attn_groups):
+                    group_common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+                    group_block_table = self.runner.input_batch.block_table[attn_group.kv_cache_group_id]
+                    group_common_attn_metadata.block_table_tensor = group_block_table.get_device_tensor()
+
+                    updated_common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
                         draft_index,
                         attn_metadata,
-                        common_attn_metadata,
+                        group_common_attn_metadata,
                         batch_size,
                         num_input_tokens,
                         used_update_positions,
                         aclgraph_runtime_mode,
                         **draft_cp_kwargs,
                         attn_group=attn_group,
+                        advance_common_metadata=group_index == 0,
                     )
-                    for layer_name in self.attn_layer_names:
+                    if group_index == 0:
+                        common_attn_metadata = updated_common_attn_metadata
+                    for layer_name in attn_group.layer_names:
                         per_layer_attn_metadata[layer_name] = attn_metadata
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
@@ -1507,7 +1628,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_model_config = getattr(self, "draft_model_config", None)
             hf_config = getattr(draft_model_config, "hf_config", None)
             architectures = getattr(hf_config, "architectures", []) or []
-            return "DeepSeekMTPModel" in architectures
+            return any(
+                architecture in architectures
+                for architecture in ("DeepSeekMTPModel", "Glm5NextMTPModel")
+            )
         return self.method not in ("mtp", "draft_model", "dflash")
 
     def attn_update_stack_num_spec_norm(
@@ -1525,12 +1649,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         slot_indices=None,
         mtp_slot_mapping=None,
         attn_group=None,
+        advance_common_metadata=True,
     ):
         assert draft_index > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
-        if draft_index == 1:
+        if draft_index == 1 and advance_common_metadata:
             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._adjust_tensor(
@@ -1568,7 +1693,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.num_input_tokens = input_batch_size
 
         # The loop part
-        used_update_positions += 1
+        if advance_common_metadata:
+            used_update_positions += 1
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -1602,44 +1728,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # For data integrity when async scheduling, we shouldn't use in place
         # operations in case they are modified in next step's `prepare_input`
         # of main model.
-        # Increment the sequence lengths.
-        common_attn_metadata.seq_lens[:batch_size] += 1
-        # For the requests that exceed the max model length, we set the
-        # sequence length to 1 to minimize their overheads in attention.
-        exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
-        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
-        if common_attn_metadata.seq_lens_cpu is not None:
-            common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
-        if common_attn_metadata.num_computed_tokens_cpu is not None:
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
-        if self.uses_mrope:
-            common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
-        else:
-            common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
+        if advance_common_metadata:
+            # Increment the sequence lengths once per speculative step.
+            common_attn_metadata.seq_lens[:batch_size] += 1
+            # Keep requests beyond max length in range with minimal work.
+            exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
+            if self.uses_mrope:
+                common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
+            else:
+                common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
 
         pcp_manager = getattr(self.runner, "pcp_manager", None)
+        slot_mapping_buffer = self._slot_mapping_group_by_gid[attn_group.kv_cache_group_id][draft_index]
+        group_block_table = self.runner.input_batch.block_table[attn_group.kv_cache_group_id]
+
         if pcp_manager is not None:
             kv_cache_spec = getattr(attn_group, "kv_cache_spec", self.draft_attn_groups[0].kv_cache_spec)
             # update slot_mapping
             slot_indices += self.pcp_size
             slot_mapping = mtp_slot_mapping[slot_indices]
-            self.slot_mapping_group[draft_index][: batch_size * self.pcp_size] = slot_mapping
-            self.slot_mapping_group[draft_index][batch_size * self.pcp_size :].fill_(PADDING_SLOT_ID)
-            common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+            slot_mapping_buffer[: batch_size * self.pcp_size] = slot_mapping
+            slot_mapping_buffer[batch_size * self.pcp_size :].fill_(PADDING_SLOT_ID)
+            common_attn_metadata.slot_mapping = slot_mapping_buffer
         else:
-            # NOTE: In vllm, `block_size = attn_metadata_builder.kv_cache_spec.block_size`.
-            # However, in vllm-ascend, the above value can be multiple of `kernel_block_size`,
-            # which is not correct for computing `slot_mapping` below.
-            if self.has_gdn:
-                block_size = self.kernel_block_size
-            else:
-                block_size = self.block_size
+            # Use this cache group's effective logical block size.
+            block_size = group_block_table.block_size
 
             # Compute the slot mapping.
             if self.uses_mrope:
@@ -1657,10 +1781,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
-            self.slot_mapping_group[draft_index][: slot_mapping.shape[0]].copy_(slot_mapping.to(torch.int32))
-            self.slot_mapping_group[draft_index][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
-            # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
-            common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+            slot_mapping_buffer[: slot_mapping.shape[0]].copy_(slot_mapping.to(torch.int32))
+            slot_mapping_buffer[slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
+            # Each cache group keeps an independent slot-mapping tensor.
+            common_attn_metadata.slot_mapping = slot_mapping_buffer
 
         self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
@@ -1677,12 +1801,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         attn_metadata_builder = attn_group.get_metadata_builder()
 
         extra_attn_metadata_args = {}
-        if self.use_compress:
+        if self.use_compress and attn_group.kv_cache_group_id == self.kv_cache_gid:
             extra_attn_metadata_args = dict(
                 prefill_ratio_to_sas_metadata=dict(),
                 decode_ratio_to_sas_metadata=dict(),
                 common_ratio_to_sas_metadata=dict(),
-                block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
+                block_size=attn_group.kv_cache_spec.block_size,
             )
         attn_metadata = attn_metadata_builder.build_for_drafting(
             common_attn_metadata,

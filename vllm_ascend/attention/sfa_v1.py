@@ -389,7 +389,24 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
-        cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
+        if self.rope_dim > 0:
+            cos, sin = get_cos_and_sin_mla(
+                input_positions,
+                use_cache=(draft_index is None),
+            )
+        else:
+            # NoPE models do not instantiate a rotary module, hence there is
+            # no global cos/sin cache to index. Keep metadata shapes valid for
+            # the shared SFA path; the Indexer KPool MLA implementation skips every RoPE op.
+            cos = torch.empty(
+                input_positions.shape[0],
+                1,
+                1,
+                0,
+                dtype=self.model_config.dtype,
+                device=input_positions.device,
+            )
+            sin = torch.empty_like(cos)
 
         dsa_cp_context = None
         if self.enable_dsa_cp:
@@ -1264,6 +1281,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_full_kv(self, k, attn_metadata):
         return k
 
+    def _get_indexer_slot_mapping(self, attn_metadata):
+        return attn_metadata.slot_mapping
+
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -1614,6 +1634,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         """
         return
 
+    def _store_indexer_cache(
+        self,
+        cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Store indexer rows; specialized backends may filter mappings."""
+        torch_npu.npu_scatter_nd_update_(
+            cache.view(-1, values.shape[-1]),
+            slot_mapping.view(-1, 1),
+            values.view(-1, values.shape[-1]),
+        )
+
     def forward(
         self,
         layer_name,
@@ -1635,6 +1668,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
+        indexer_slot_mapping = self._get_indexer_slot_mapping(attn_metadata)
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
@@ -1906,10 +1940,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.block_size,
                 )
             else:
-                torch_npu.npu_scatter_nd_update_(
-                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
-                    k_li.view(-1, k_li.shape[-1]),
+                self._store_indexer_cache(
+                    kv_cache[dsa_k_cache_idx],
+                    indexer_slot_mapping,
+                    k_li,
                 )  # b, s, n, d
             if self.enable_sparse_li_c8:
                 assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
@@ -1926,7 +1960,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            indexer_slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 

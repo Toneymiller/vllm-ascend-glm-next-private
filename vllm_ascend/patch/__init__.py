@@ -898,17 +898,17 @@
 #      `vllm.model_executor.model_loader.base_loader.process_weights_after_loading`
 #      and imported references in vllm-ascend model loaders
 #    Why:
-#       DSA attention is implemented in vllm-ascend as the plugin layer
-#       `DSAAttention`. Upstream vLLM only runs post-load attention weight
-#       processing for built-in attention classes, so
-#       `DSAAttention.process_weights_after_loading()` is skipped in the
-#       original loader flow. DSV4 DSA-CP o-proj TP initialization must run in
-#       this post-load phase rather than being initialized lazily in forward.
+#       DSA and GLM-5 Indexer KPool MLA attention are implemented in
+#       vllm-ascend as plugin layers. Upstream vLLM only runs post-load
+#       attention weight processing for built-in attention classes, so their
+#       `process_weights_after_loading()` methods are skipped in the original
+#       loader flow. DSV4 DSA-CP o-proj TP initialization and GLM-5 MLA's
+#       absorbed W_UK_T/W_UV weights must be built before the first forward.
 #    How:
 #       Rebind the upstream `process_weights_after_loading` helper, including
-#       already-imported loader references, so `DSAAttention` participates in
-#       the same post-load traversal while preserving the original quant-method
-#       and torchao reload behavior.
+#       already-imported loader references, so both Ascend plugin attention
+#       layers participate in the same post-load traversal while preserving
+#       the original quant-method and torchao reload behavior.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm-ascend/pull/10694
 #       https://github.com/vllm-project/vllm/pull/46828

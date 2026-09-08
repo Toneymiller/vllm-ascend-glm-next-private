@@ -29,19 +29,18 @@ from vllm_ascend.device.mxfp_compat import (
     QUANT_DTYPES,
     SCALE_DTYPES,
 )
-from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
-from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
-from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
 
-if HAS_TRITON:
-    from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
-else:
-    triton_q_rms = None  # type: ignore
+# NOTE: triton kernels under vllm_ascend.ops.* must be imported lazily inside
+# the methods that use them. vllm_ascend/ops/__init__.py transitively imports
+# this module (ops.fused_moe.experts_selector -> device.device_op), so a
+# module-level import here creates a device<->ops circular import whenever
+# device_op is imported before the ops package (e.g. in the vLLM model
+# registry inspection subprocess).
 
 
 class BaseDeviceAdaptor:
@@ -717,6 +716,83 @@ class BaseDeviceAdaptor:
         )
 
     @staticmethod
+    def execute_sparse_attention_indexer_kpool_mla(
+        sfa_impl,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        packed_kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
+        sparse_mode: int = 3,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Execute Indexer KPool MLA attention via npu_sparse_flash_attention with rope=None."""
+        if return_lse:
+            raise NotImplementedError("Indexer KPool MLA attention does not expose LSE.")
+        if sparse_mode != 3:
+            raise ValueError(f"Indexer KPool MLA only supports sparse_mode=3, got {sparse_mode}.")
+        if block_table is None:
+            block_table = attn_metadata.block_table
+        query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        # In eager MTP/draft steps the draft model forwards the full
+        # first-pass token buffer (num_input_tokens rows) while the attention
+        # metadata only describes the real query rows (num_actual_tokens, one
+        # per request).  The indexer truncates to the real rows, so
+        # topk_indices carries exactly one row per actual token, aligned with
+        # the leading rows of `query`.  npu_sparse_flash_attention (TND) only
+        # processes the first actual_seq_lengths_query[-1] query rows, so pad
+        # the sparse indices up to the padded query length with in-bounds
+        # zeros; the extra rows are never consumed by the kernel.
+        if topk_indices.shape[0] != query.shape[0]:
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            if topk_indices.shape[0] != num_actual_tokens or num_actual_tokens > query.shape[0]:
+                raise RuntimeError(
+                    f"topk_indices rows {topk_indices.shape[0]} align with neither "
+                    f"query tokens {query.shape[0]} nor actual tokens {num_actual_tokens}."
+                )
+            pad_rows = query.shape[0] - num_actual_tokens
+            topk_indices = torch.cat(
+                [
+                    topk_indices,
+                    topk_indices.new_zeros((pad_rows, *topk_indices.shape[1:])),
+                ],
+                dim=0,
+            )
+        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query,
+            key=packed_kv_cache,
+            value=packed_kv_cache,
+            sparse_indices=topk_indices,
+            scale_value=sfa_impl.scale,
+            sparse_block_size=1,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_key,
+            query_rope=None,
+            key_rope=None,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=sparse_mode,
+            attention_mode=2,
+            return_softmax_lse=return_lse,
+        )
+        if not isinstance(result, tuple):
+            if return_lse:
+                raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
+            return result
+        attn_output, softmax_max, softmax_sum = result
+        return BaseDeviceAdaptor._format_sparse_flash_attention_output(
+            attn_output,
+            softmax_max,
+            softmax_sum,
+            return_lse,
+        )
+
+    @staticmethod
     def execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -832,6 +908,20 @@ class BaseDeviceAdaptor:
         return {}
 
     @staticmethod
+    def supports_sharedkv_indexer_kpool_mla() -> bool:
+        """Whether Indexer KPool MLA should build A5 shared-KV metadata."""
+        return False
+
+    @staticmethod
+    def get_sparse_attention_metadata_op_indexer_kpool_mla():
+        raise NotImplementedError("Indexer KPool MLA fused sparse attention is A5-only.")
+
+    @staticmethod
+    def get_sparse_attention_metadata_kwargs_indexer_kpool_mla(device):
+        del device
+        raise NotImplementedError("Indexer KPool MLA fused sparse attention is A5-only.")
+
+    @staticmethod
     def get_dsa_compressor_slot_mapping_format():
         """Slot mapping side output format consumed by the DSA scatter op."""
         return DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET
@@ -930,7 +1020,8 @@ class BaseDeviceAdaptor:
     def apply_dsa_q_rms(q, eps, q_norm_without_weight=None):
         """Apply Q RMS norm. Non-A5: triton_q_rms.
         A5: uses q_norm_without_weight callable when provided."""
-        if triton_q_rms is not None:
+        if HAS_TRITON:
+            from vllm_ascend.ops.triton.rms_norm import triton_q_rms
             return triton_q_rms(q, eps)
         else:
             dtype = q.dtype
@@ -1005,6 +1096,7 @@ class BaseDeviceAdaptor:
     def chunk_scaled_dot_kkt_fwd(
         num_core, bh_step, task_num, k, beta, g_cumsum, A, cu_seqlens, chunk_indices, T, B, H, Hg, K, BT, BK
     ):
+        from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
         chunk_scaled_dot_kkt_fwd_kernel[(num_core,)](
             k=k,
             beta=beta,
@@ -1043,6 +1135,7 @@ class BaseDeviceAdaptor:
         B,
     ):
         extract_slice_stride_1 = LARGE_BLOCK_T // 32
+        from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
         solve_tril_16x16_kernel[NT, B * H](
             A=A,
             Ad=Ad,
@@ -1616,6 +1709,115 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64}
 
     @staticmethod
+    def supports_sharedkv_indexer_kpool_mla() -> bool:
+        return True
+
+    @staticmethod
+    def get_sparse_attention_metadata_op_indexer_kpool_mla():
+        return torch.ops._C_ascend.npu_sparse_flash_mla_metadata
+
+    @staticmethod
+    def get_sparse_attention_metadata_kwargs_indexer_kpool_mla(device):
+        return {"device": str(device)}
+
+    @staticmethod
+    def execute_sparse_attention_indexer_kpool_mla(
+        sfa_impl,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        packed_kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
+        sparse_mode: int = 3,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_lse:
+            raise NotImplementedError("GLM-5 A5 shared-KV sparse attention does not expose LSE.")
+        if sfa_impl.qk_rope_head_dim != 0 or q_pe.shape[-1] != 0:
+            raise ValueError("GLM-5 A5 shared-KV sparse attention requires qk_rope_head_dim=0.")
+        if packed_kv_cache.dtype != torch.bfloat16:
+            raise ValueError(
+                "Indexer KPool MLA A5 shared-KV cache must use BF16, "
+                f"got {packed_kv_cache.dtype}."
+            )
+        if packed_kv_cache.shape[-1] != sfa_impl.kv_lora_rank:
+            raise ValueError(
+                "Indexer KPool MLA A5 shared-KV cache head dim must be "
+                f"{sfa_impl.kv_lora_rank}, got {packed_kv_cache.shape[-1]}."
+            )
+        if attn_metadata.sas_metadata is None:
+            raise RuntimeError("GLM-5 A5 shared-KV sparse attention metadata is missing.")
+        if attn_metadata.query_start_loc is None:
+            raise RuntimeError("GLM-5 A5 query_start_loc metadata is missing.")
+        if block_table is None:
+            block_table = attn_metadata.block_table
+
+        if attn_metadata.sas_sinks is None:
+            raise RuntimeError("GLM-5 A5 sparse attention sinks (sas_sinks) is missing.")
+
+        # GLM-5 Indexer KPool MLA has only one KV cache (the packed MLA
+        # latent+RoPE). It is not a compressed representation of a larger
+        # original KV, so route real data through the ori_* (original) path
+        # and leave cmp_* (compressed) parameters at their None defaults.
+
+        # The indexer emits top-k positions in score order, so adjacent
+        # columns can jump between far-apart KV tokens. sparse_flash_mla's
+        # A5 kernel merges each adjacent column pair into one strided DMA
+        # copy; large jumps overflow the copy stride and read the wrong
+        # cache bytes (NaN outputs in some cache layouts). Sort every row
+        # ascending (-1 padding sinks to the tail) so each adjacent column
+        # pair maps to consecutive KV tokens. The attended set is unchanged.
+        sorted_topk = torch.where(
+            topk_indices >= 0,
+            topk_indices,
+            torch.iinfo(torch.int32).max,
+        )
+        sorted_topk, _ = torch.sort(sorted_topk, dim=-1)
+        sorted_topk = torch.where(
+            sorted_topk != torch.iinfo(torch.int32).max,
+            sorted_topk,
+            -1,
+        )
+        topk_indices = sorted_topk
+        ori_topk_length = (topk_indices >= 0).sum(dim=-1, keepdim=True).to(torch.int32)
+
+        result = torch.ops._C_ascend.npu_sparse_flash_mla(
+            ql_nope,
+            ori_kv=packed_kv_cache,
+            cmp_kv=None,
+            ori_sparse_indices=topk_indices,
+            cmp_sparse_indices=None,
+            ori_block_table=block_table,
+            cmp_block_table=None,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            cu_seqlens_ori_kv=None,
+            cu_seqlens_cmp_kv=None,
+            seqused_q=None,
+            seqused_ori_kv=actual_seq_lengths_key,
+            seqused_cmp_kv=None,
+            cmp_residual_kv=None,
+            ori_topk_length=ori_topk_length,
+            cmp_topk_length=None,
+            sinks=attn_metadata.sas_sinks,
+            metadata=attn_metadata.sas_metadata,
+            softmax_scale=sfa_impl.scale,
+            cmp_ratio=1,
+            ori_mask_mode=sparse_mode,
+            cmp_mask_mode=3,
+            ori_win_left=0,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            topk_value_mode=1,
+            return_softmax_lse=False,
+        )
+        return result[0]
+
+    @staticmethod
     def get_dsa_compressor_slot_mapping_format():
         """A5 kv_compress_epilog consumes flat slot ids."""
         return DSA_COMPRESSOR_SLOT_MAPPING_FLAT
@@ -1724,7 +1926,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         if q_norm_without_weight is not None:
             return q_norm_without_weight(q)
 
-        if triton_q_rms is not None:
+        if HAS_TRITON:
+            from vllm_ascend.ops.triton.rms_norm import triton_q_rms
             return triton_q_rms(q, eps)
         else:
             dtype = q.dtype
@@ -1983,6 +2186,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     def chunk_scaled_dot_kkt_fwd(
         num_core, bh_step, task_num, k, beta, g_cumsum, A, cu_seqlens, chunk_indices, T, B, H, Hg, K, BT, BK
     ):
+        from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
         chunk_scaled_dot_kkt_fwd_kernel[(num_core,)](
             k=k,
             beta=beta,
@@ -2020,6 +2224,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         NT,
         B,
     ):
+        from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
         solve_tril_16x16_kernel[NT, B * H](
             A=A,
             Ad=Ad,
@@ -2043,6 +2248,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
     @staticmethod
     def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
+        from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
         return fused_gdn_gating_patch(A_log, a, b, dt_bias)
 
     @staticmethod

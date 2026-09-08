@@ -75,7 +75,13 @@ class TestAscendMultiHeadLatentAttention(TestBase):
 
     @patch("vllm_ascend.ops.mla.get_current_vllm_config")
     @patch("vllm_ascend.ops.mla.get_tensor_model_parallel_world_size")
-    def test_initialization(self, mock_tp_size, mock_get_vllm_config):
+    @patch("vllm_ascend.ops.mla.uses_global_inputs_embeds", return_value=False)
+    def test_initialization(
+        self,
+        mock_uses_global_inputs_embeds,
+        mock_tp_size,
+        mock_get_vllm_config,
+    ):
         # Create a proper mock for MLAAttention that has the required attributes
         mock_mla_attn = MagicMock()
         mock_mla_attn.process_weights_after_loading = MagicMock()
@@ -106,6 +112,11 @@ class TestAscendMultiHeadLatentAttention(TestBase):
 
             self.assertEqual(attn.tp_size, 2)
             self.assertIsNotNone(attn.mla_attn)
+            self.assertFalse(attn.is_vl_first_layer)
+            mock_uses_global_inputs_embeds.assert_called_once_with(
+                mock_vllm_config,
+                "image",
+            )
 
     @patch("vllm_ascend.ops.mla.torch.ops.vllm.mla_forward")
     @patch("vllm_ascend.ops.mla.get_current_vllm_config")

@@ -37,6 +37,17 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
     return residual
 
 
+def _maybe_chunk_residual_fake(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    # The real op chunks ``residual`` along dim 0 to match ``x`` and keeps
+    # all trailing dims (e.g. MHC residual streams [N, n, d]); ``empty_like(x)``
+    # would collapse those dims and break Dynamo's shape inference.
+    return torch.empty(
+        (x.shape[0], *residual.shape[1:]),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+
+
 def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
@@ -220,7 +231,7 @@ def _muls_add_impl_fake(
 direct_register_custom_op(
     op_name="maybe_chunk_residual",
     op_func=_maybe_chunk_residual_impl,
-    fake_impl=lambda x, residual: torch.empty_like(x),
+    fake_impl=_maybe_chunk_residual_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )
